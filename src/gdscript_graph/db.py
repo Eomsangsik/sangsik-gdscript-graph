@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from gdscript_graph.calls import extract_calls_and_connections
 from gdscript_graph.discovery import discover
-from gdscript_graph.parsing import parse_all
+from gdscript_graph.parse_cache import ParseCache, load_cache, parse_all_cached, save_cache
 from gdscript_graph.resolve import (
     build_class_name_table,
     build_function_index,
@@ -97,6 +98,30 @@ CREATE TABLE unresolved_connections (
     line INTEGER NOT NULL,
     reason TEXT NOT NULL
 );
+
+-- Key/value store for build-time facts about the database itself, as
+-- opposed to facts about the indexed project. Lets `gdscript-graph mcp
+-- <db>` recover the project root it was built from (to start a file
+-- watcher against it) without requiring it as a separate, easy-to-typo
+-- CLI argument that could silently point at the wrong directory.
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Carries each file's already-parsed tree forward from one build to the
+-- next, keyed by a content hash -- an unchanged hash guarantees a
+-- bit-for-bit identical tree (parsing is a pure function of a file's own
+-- bytes), so skipping re-parsing on a cache hit is always safe. Not part
+-- of REQUIRED_TABLES: it's a pure performance optimization, never
+-- required for a db to be valid -- if missing (e.g. the previous build
+-- predates this feature, or the db is fresh), every file simply parses
+-- fresh, same as before this cache existed.
+CREATE TABLE parse_cache (
+    res_path TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    tree_blob BLOB NOT NULL
+);
 """
 
 
@@ -118,11 +143,21 @@ class BuildStats:
     # ambiguity existed, which is usually a real authoring mistake worth
     # surfacing rather than silently picking a winner.
     duplicate_class_names: dict[str, list[str]]
+    # How many of `file_count` files reused a cached tree from the previous
+    # build (skipping the ~20-30x more expensive Lark parse) vs. how many
+    # were freshly parsed (new/changed file, or no usable previous build).
+    parse_cache_hits: int
+    parse_cache_misses: int
 
 
 def build_database(project_root: Path, db_path: Path) -> BuildStats:
     if db_path.exists() and db_path.is_dir():
         raise IsADirectoryError(f"-o path is a directory, not a file: {db_path}")
+
+    # Load the previous build's cached trees (if any) *before* touching
+    # db_path -- this is the only chance to read them before the atomic
+    # swap below replaces the file they live in.
+    old_parse_cache = load_cache(db_path)
 
     # Build into a temp file and atomically swap it into place at the end,
     # so a failure partway through a rebuild never destroys a previously
@@ -132,7 +167,7 @@ def build_database(project_root: Path, db_path: Path) -> BuildStats:
 
     conn = sqlite3.connect(tmp_path)
     try:
-        stats = _populate(conn, project_root)
+        stats = _populate(conn, project_root, old_parse_cache)
         conn.commit()
     except Exception:
         conn.close()
@@ -155,11 +190,18 @@ def build_database(project_root: Path, db_path: Path) -> BuildStats:
     return stats
 
 
-def _populate(conn: sqlite3.Connection, project_root: Path) -> BuildStats:
+def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: ParseCache | None = None) -> BuildStats:
     conn.executescript(SCHEMA)
+    conn.executemany(
+        "INSERT INTO meta (key, value) VALUES (?, ?)",
+        [("project_root", str(project_root)), ("built_at", str(time.time()))],
+    )
 
     project = discover(project_root)
-    parse_results = parse_all(project.gd_files, project.to_res_path)
+    parse_results, new_parse_cache, cache_hits = parse_all_cached(
+        project.gd_files, project.to_res_path, old_parse_cache or {}
+    )
+    save_cache(conn, new_parse_cache)
 
     # A pathologically deep expression/call nesting (e.g. 1000+ levels of
     # nested calls) parses fine at the Lark level but can blow Python's
@@ -377,6 +419,8 @@ def _populate(conn: sqlite3.Connection, project_root: Path) -> BuildStats:
         resolved_connection_count=resolved_connection_count,
         unresolved_connection_count=unresolved_connection_count,
         duplicate_class_names=duplicate_class_names,
+        parse_cache_hits=cache_hits,
+        parse_cache_misses=len(parse_results) - cache_hits,
     )
 
 
@@ -393,6 +437,53 @@ def search_symbols(conn: sqlite3.Connection, query: str, limit: int = 20) -> lis
         "SELECT res_path, name, kind, scope, line FROM symbols WHERE name LIKE ? ESCAPE '\\' ORDER BY name LIMIT ?",
         (like, limit),
     ).fetchall()
+
+
+def list_files(conn: sqlite3.Connection, prefix: str | None = None) -> list[dict]:
+    query = "SELECT res_path, class_name, extends, parse_error FROM files"
+    params: list[str] = []
+    if prefix is not None:
+        # Escape LIKE metacharacters same as search_symbols -- a prefix
+        # containing a literal "%"/"_" (unusual in a res:// path, but not
+        # impossible) must be matched literally, not as a wildcard.
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query += " WHERE res_path LIKE ? ESCAPE '\\'"
+        params.append(f"{escaped}%")
+    query += " ORDER BY res_path"
+    file_rows = conn.execute(query, params).fetchall()
+
+    # One query for symbol counts across every file, not one query per
+    # file -- a `files()` call must stay cheap regardless of project size.
+    counts_by_file: dict[str, dict[str, int]] = {}
+    for row in conn.execute("SELECT res_path, kind, COUNT(*) AS n FROM symbols GROUP BY res_path, kind"):
+        counts_by_file.setdefault(row["res_path"], {})[row["kind"]] = row["n"]
+
+    return [
+        {**dict(row), "symbol_counts": counts_by_file.get(row["res_path"], {})}
+        for row in file_rows
+    ]
+
+
+def find_symbol_locations(
+    conn: sqlite3.Connection,
+    name: str,
+    res_path: str | None = None,
+    scope: str | None = None,
+    kind: str | None = None,
+) -> list[sqlite3.Row]:
+    query = "SELECT id, res_path, name, kind, scope, line, is_static FROM symbols WHERE name = ?"
+    params: list[str] = [name]
+    if res_path is not None:
+        query += " AND res_path = ?"
+        params.append(res_path)
+    if scope is not None:
+        query += " AND scope = ?"
+        params.append(scope)
+    if kind is not None:
+        query += " AND kind = ?"
+        params.append(kind)
+    query += " ORDER BY res_path, scope, line"
+    return conn.execute(query, params).fetchall()
 
 
 def get_callers(
@@ -549,6 +640,58 @@ def _bfs_symbols(
     return results
 
 
+def find_call_path(
+    conn: sqlite3.Connection, from_symbol_id: int, to_symbol_id: int, max_depth: int = 6
+) -> list[dict] | None:
+    """BFS over `calls` from `from_symbol_id` to `to_symbol_id`, returning
+    one concrete sequence of function symbols connecting them (inclusive of
+    both endpoints), or None if `to_symbol_id` isn't reachable within
+    `max_depth` hops. Unlike `get_callees_transitive` (which reports every
+    reachable symbol's minimum depth, merged across possibly-ambiguous
+    seeds), this reconstructs an actual path between two specific,
+    already-resolved symbol ids -- for `explore` to show *how* one named
+    symbol reaches another, not just whether it can."""
+    if from_symbol_id == to_symbol_id:
+        row = conn.execute(
+            "SELECT res_path, scope, name FROM symbols WHERE id = ?", (from_symbol_id,)
+        ).fetchone()
+        return [dict(row)] if row is not None else None
+
+    adjacency: dict[int, set[int]] = {}
+    for src, tgt in _load_call_edges(conn):
+        adjacency.setdefault(src, set()).add(tgt)
+
+    parent: dict[int, int] = {}
+    visited = {from_symbol_id}
+    frontier = [from_symbol_id]
+    depth = 0
+    while frontier and depth < max_depth:
+        depth += 1
+        next_frontier: list[int] = []
+        for sid in frontier:
+            for neighbor in adjacency.get(sid, ()):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                parent[neighbor] = sid
+                if neighbor == to_symbol_id:
+                    chain = [neighbor]
+                    while chain[-1] != from_symbol_id:
+                        chain.append(parent[chain[-1]])
+                    chain.reverse()
+                    rows = {
+                        row["id"]: row
+                        for row in conn.execute(
+                            f"SELECT id, res_path, scope, name FROM symbols WHERE id IN ({','.join('?' * len(chain))})",
+                            chain,
+                        )
+                    }
+                    return [dict(rows[sid]) for sid in chain]
+                next_frontier.append(neighbor)
+        frontier = next_frontier
+    return None
+
+
 def get_callers_transitive(
     conn: sqlite3.Connection,
     function_name: str,
@@ -571,8 +714,13 @@ def get_callees_transitive(
 
 REQUIRED_TABLES = {
     "files", "symbols", "calls", "unresolved_calls",
-    "signal_connections", "unresolved_connections",
+    "signal_connections", "unresolved_connections", "meta",
 }
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row is not None else None
 
 
 def validate_schema(conn: sqlite3.Connection) -> None:

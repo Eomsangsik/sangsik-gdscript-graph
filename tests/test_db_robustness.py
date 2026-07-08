@@ -267,7 +267,7 @@ def test_failed_rebuild_preserves_existing_database(godot_project, monkeypatch):
 
     import gdscript_graph.db as db_module
 
-    def boom(conn, project_root):
+    def boom(conn, project_root, old_parse_cache=None):
         conn.executescript(db_module.SCHEMA)
         raise RuntimeError("simulated failure")
 
@@ -309,6 +309,36 @@ def test_build_output_path_as_existing_directory_raises_clear_error(godot_projec
     out_dir.mkdir()
     with pytest.raises(IsADirectoryError):
         build_database(godot_project.root, out_dir)
+
+
+def test_build_records_project_root_in_meta_table(godot_project):
+    """Regression test: `run_server` recovers the project root a db was
+    built from out of `meta` to know what directory to auto-watch for
+    changes -- without this, a rebuild could silently drift out of sync
+    with whatever directory the db actually indexes."""
+    godot_project.write("x.gd", "extends Node\nfunc a():\n    pass\n")
+    conn = godot_project.build()
+    assert gdb.get_meta(conn, "project_root") == str(godot_project.root)
+    assert gdb.get_meta(conn, "built_at") is not None
+    assert gdb.get_meta(conn, "no_such_key") is None
+
+
+def test_validate_schema_rejects_database_missing_meta_table(tmp_path):
+    """Regression test: an older db built before the `meta` table existed
+    must be rejected with a clear message, not silently treated as having
+    no recorded project root (which `run_server` also handles, but as a
+    distinct "disable watching" case, not a "this db is stale/invalid"
+    case)."""
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        for table in gdb.REQUIRED_TABLES - {"meta"}:
+            conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
+        with pytest.raises(ValueError):
+            gdb.validate_schema(conn)
+    finally:
+        conn.close()
 
 
 def test_cli_build_rejects_missing_project_dir(tmp_path, capsys):
@@ -355,7 +385,7 @@ def test_cli_build_warns_about_duplicate_class_name(godot_project, capsys):
 
 def test_cli_mcp_rejects_missing_db_without_traceback(tmp_path, capsys):
     missing_db = tmp_path / "does_not_exist.db"
-    args = SimpleNamespace(db=str(missing_db))
+    args = SimpleNamespace(db=str(missing_db), no_watch=False, debounce_ms=2000.0)
     exit_code = _cmd_mcp(args)
     assert exit_code == 1
     assert "not found" in capsys.readouterr().err

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from gdscript_graph.db import build_database
+from gdscript_graph.watch import DEFAULT_DEBOUNCE_SECONDS
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
@@ -24,7 +25,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
     except (OSError, sqlite3.Error) as exc:
         print(f"error: could not write database to {db_path}: {exc}", file=sys.stderr)
         return 1
-    print(f"files: {stats.file_count} (parse errors: {stats.parse_error_count})")
+    print(
+        f"files: {stats.file_count} (parse errors: {stats.parse_error_count}, "
+        f"reused from cache: {stats.parse_cache_hits}, reparsed: {stats.parse_cache_misses})"
+    )
     print(
         f"functions: {stats.function_count}, signals: {stats.signal_count}, "
         f"fields: {stats.field_count}, enums: {stats.enum_count}"
@@ -49,7 +53,7 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
 
     db_path = Path(args.db).resolve()
     try:
-        run_server(db_path)
+        run_server(db_path, watch=not args.no_watch, debounce_seconds=args.debounce_ms / 1000)
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -67,6 +71,14 @@ def main() -> None:
 
     mcp_parser = subparsers.add_parser("mcp", help="Run the MCP server against a built graph DB")
     mcp_parser.add_argument("db", help="Path to the graph DB")
+    mcp_parser.add_argument(
+        "--no-watch", action="store_true",
+        help="Disable auto-rebuild on .gd/.tscn/project.godot changes (watches by default)",
+    )
+    mcp_parser.add_argument(
+        "--debounce-ms", type=float, default=DEFAULT_DEBOUNCE_SECONDS * 1000,
+        help=f"Milliseconds to wait after the last file change before auto-rebuilding (default: {int(DEFAULT_DEBOUNCE_SECONDS * 1000)})",
+    )
     mcp_parser.set_defaults(func=_cmd_mcp)
 
     args = parser.parse_args()
