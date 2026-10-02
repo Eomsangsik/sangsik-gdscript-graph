@@ -127,3 +127,57 @@ def test_editing_an_unrelated_file_does_not_trigger_a_rebuild(godot_project):
         assert built_at_after == built_at_before
     finally:
         handle.stop()
+
+
+class _FakeEvent:
+    def __init__(self, event_type: str, src_path: str, is_directory: bool = False) -> None:
+        self.event_type = event_type
+        self.src_path = src_path
+        self.is_directory = is_directory
+
+
+def test_open_and_read_only_close_events_do_not_schedule_a_rebuild(tmp_path):
+    """Regression test: inotify reports plain opens and read-only closes
+    (`opened`, `closed_no_write`) -- and a rebuild itself opens and reads
+    every .gd file, so reacting to those turned each rebuild into the
+    trigger for the next one, rebuilding forever on Linux with nothing
+    edited. Checked against the handler directly (not a live watcher) so it
+    fails on every OS, not just the one whose backend emits these events."""
+    handler = watch_module._DebouncedRebuildHandler(tmp_path, tmp_path / "graph.db", debounce_seconds=60)
+    scheduled: list[str] = []
+    handler._schedule_rebuild = lambda delay=None: scheduled.append("rebuild")
+
+    gd_path = str(tmp_path / "main.gd")
+    for event_type in ("opened", "closed_no_write", "closed"):
+        handler.on_any_event(_FakeEvent(event_type, gd_path))
+    assert scheduled == []
+
+    for event_type in ("created", "modified", "deleted", "moved"):
+        handler.on_any_event(_FakeEvent(event_type, gd_path))
+    assert len(scheduled) == 4
+
+
+def test_reading_watched_files_does_not_trigger_a_rebuild(godot_project):
+    """Regression test (live watcher): merely reading a .gd/.tscn file --
+    exactly what every rebuild, and the `node` tool's fresh source lookup,
+    does -- must not trigger a rebuild. On Linux this used to loop forever."""
+    godot_project.write("main.gd", "extends Node\nfunc foo():\n    pass\n")
+    godot_project.write("main.tscn", '[gd_scene format=3]\n\n[node name="Main" type="Node"]\n')
+    conn = godot_project.build()
+    conn.close()
+
+    db_path = godot_project.root.parent / "graph.db"
+    handle = start_watching(godot_project.root, db_path, debounce_seconds=0.3)
+    try:
+        assert _wait_for(lambda: not handle.is_pending())  # let the reconcile-on-start rebuild settle
+        time.sleep(0.5)
+        built_at_before = gdb.get_meta(gdb.connect(db_path), "built_at")
+
+        for name in ("main.gd", "main.tscn", "project.godot"):
+            (godot_project.root / name).read_text()
+        time.sleep(1.5)
+
+        assert not handle.is_pending()
+        assert gdb.get_meta(gdb.connect(db_path), "built_at") == built_at_before
+    finally:
+        handle.stop()

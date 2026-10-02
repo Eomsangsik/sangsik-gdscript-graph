@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import posixpath
 from dataclasses import dataclass, field
 
 from lark import Token, Tree
@@ -28,6 +29,13 @@ class FieldSymbol:
     line: int
     kind: str  # "var" | "const"
     scope: str | None = None
+    # The field's static type, when one is fixed at declaration: an explicit
+    # annotation (`var a: T`), or inferred from a `:=` initializer (or a
+    # const's value) of a shape whose type is certain -- see
+    # `infer_expr_type`. Either a type name as written (resolved later, in
+    # this file's scope, by resolve.py) or a res:// script path (from
+    # `preload`). None = untyped/unknown.
+    type_name: str | None = None
 
 
 @dataclass
@@ -300,6 +308,84 @@ def iter_property_accessor_defs(tree: Tree) -> list[PropertyAccessorInfo]:
     return results
 
 
+def _preload_script_path(call: Tree, res_path: str | None) -> str | None:
+    """For a `preload("<path>.gd")` standalone_call, the res:// path of the
+    preloaded script (a relative path is resolved against `res_path`'s own
+    directory, as Godot does), else None."""
+    if len(call.children) != 2:
+        return None
+    callee, arg = call.children
+    if not (isinstance(callee, Token) and str(callee) == "preload"):
+        return None
+    if not (isinstance(arg, Tree) and arg.data == "string" and arg.children):
+        return None
+    path = str(arg.children[0]).strip("\"'")
+    if not path.endswith(".gd"):
+        return None
+    if not path.startswith("res://"):
+        if res_path is None:
+            return None
+        base_dir = posixpath.dirname(res_path.removeprefix("res://"))
+        path = "res://" + posixpath.normpath(posixpath.join(base_dir, path))
+    return path
+
+
+def infer_expr_type(node: object, res_path: str | None = None) -> str | None:
+    """The static type of an initializer expression, for the few shapes
+    whose type is certain without any wider analysis: `<expr> as T` -> "T",
+    `T.new(...)` -> "T", `preload("x.gd")` / `preload("x.gd").new(...)` ->
+    "res://x.gd". Anything else -> None. Callers only use this where GDScript
+    itself fixes the type at declaration (`:=`, or a const's value) -- never
+    for a plain `var x = ...`, which stays Variant and can be reassigned to
+    anything, so inferring from it could produce a wrong edge."""
+    while isinstance(node, Tree) and node.data in ("expr", "par_expr") and len(node.children) == 1:
+        node = node.children[0]
+    if not isinstance(node, Tree):
+        return None
+    if node.data == "actual_type_cast":
+        type_token = node.children[-1] if node.children else None
+        return str(type_token) if isinstance(type_token, Token) else None
+    if node.data == "standalone_call":
+        return _preload_script_path(node, res_path)
+    if node.data == "getattr_call" and node.children:
+        getattr_node = node.children[0]
+        if not (isinstance(getattr_node, Tree) and getattr_node.data == "getattr"):
+            return None
+        base = getattr_node.children[0] if getattr_node.children else None
+        names = [c for c in getattr_node.children[1:] if isinstance(c, Token) and c.type == "NAME"]
+        if len(names) != 1 or str(names[0]) != "new":
+            return None
+        if isinstance(base, Token) and base.type == "NAME":
+            return str(base)
+        if isinstance(base, Tree) and base.data == "standalone_call":
+            return _preload_script_path(base, res_path)
+    return None
+
+
+def _declared_type(decl: Tree, res_path: str | None) -> str | None:
+    """Static type of a var/const declaration node -- `<name> : <type> ...`
+    (explicit annotation), or `<name> := <expr>` / `const <name> = <expr>`
+    (inferred via `infer_expr_type`). A plain untyped `var <name> = <expr>`
+    is deliberately None: see `infer_expr_type`."""
+    if decl.data in _TYPED_DECL_NODES and len(decl.children) >= 2:
+        type_hint = decl.children[1]
+        return str(type_hint) if isinstance(type_hint, Token) else None
+    if decl.data in _INFERRED_DECL_NODES and len(decl.children) >= 2:
+        return infer_expr_type(decl.children[1], res_path)
+    return None
+
+
+# Declaration node shapes (class-level and local) whose second child is an
+# explicit type annotation token...
+_TYPED_DECL_NODES = (
+    "class_var_typed", "class_var_typed_assgnd",
+    "func_var_typed", "func_var_typed_assgnd", "const_typed_assigned",
+)
+# ...or an initializer whose type GDScript fixes at declaration (`:=`, or
+# any const -- a const can never be reassigned).
+_INFERRED_DECL_NODES = ("class_var_inf", "func_var_inf", "const_inf", "const_assigned")
+
+
 def _collect_header_arg_types(header: Tree, types: dict[str, str | None]) -> None:
     """Walk a `func_header` node for its own declared parameters, e.g.
     `func_arg_typed` wrapped inside `func_arg_variadic`. Stops at a nested
@@ -347,7 +433,7 @@ def _collect_header_arg_names(header: Tree, names: set[str]) -> None:
     walk(header)
 
 
-def _collect_local_var_types(body: list, types: dict[str, str | None]) -> None:
+def _collect_local_var_types(body: list, types: dict[str, str | None], res_path: str | None = None) -> None:
     """Shared walk for `extract_local_var_types` and the property-accessor
     equivalent below -- both need identical var/for-loop-variable
     collection over a list of body statements, differing only in how their
@@ -356,19 +442,18 @@ def _collect_local_var_types(body: list, types: dict[str, str | None]) -> None:
     def walk(node: object) -> None:
         if not isinstance(node, Tree) or node.data == "lambda":
             return
-        if node.data in ("func_var_typed", "func_var_typed_assgnd", "const_typed_assigned") and len(node.children) >= 2:
-            name, type_hint = node.children[0], node.children[1]
-            if isinstance(name, Token) and isinstance(type_hint, Token):
-                types[str(name)] = str(type_hint)
-            return
         if (
             node.data
-            in ("func_var_empty", "func_var_assigned", "func_var_inf", "const_assigned", "const_inf", "var_capture_pattern")
+            in (
+                "func_var_typed", "func_var_typed_assgnd", "const_typed_assigned",
+                "func_var_empty", "func_var_assigned", "func_var_inf", "const_assigned", "const_inf",
+                "var_capture_pattern",
+            )
             and node.children
         ):
             name = node.children[0]
             if isinstance(name, Token):
-                types[str(name)] = None
+                types[str(name)] = _declared_type(node, res_path)
             return
         if node.data == "for_stmt_typed" and len(node.children) >= 2:
             name, type_hint = node.children[0], node.children[1]
@@ -385,11 +470,14 @@ def _collect_local_var_types(body: list, types: dict[str, str | None]) -> None:
         walk(child)
 
 
-def extract_local_var_types(func_def_node: Tree) -> dict[str, str | None]:
+def extract_local_var_types(func_def_node: Tree, res_path: str | None = None) -> dict[str, str | None]:
     """Map every local var/param/for-loop-variable name declared in a single
-    function to its declared type name, or ``None`` if it has no explicit
-    type annotation (no inference from assignment, e.g. ``var x =
-    Foo.new()`` maps to ``None`` too). Every local name is recorded, not
+    function to its static type name, or ``None`` if it has none -- an
+    explicit annotation, or a ``:=``/const initializer `infer_expr_type`
+    can type (``var x := Foo.new()`` -> ``Foo``); a plain untyped ``var x =
+    Foo.new()`` stays ``None``, since it can be reassigned to anything.
+    `res_path` (the function's own file) resolves a relative
+    ``preload("x.gd")``. Every local name is recorded, not
     just typed ones, so callers can tell "this name is a known local --
     shadowing any same-named autoload/class_name -- but of unresolvable
     type" apart from "this name isn't a local at all". Nested lambda
@@ -402,11 +490,13 @@ def extract_local_var_types(func_def_node: Tree) -> dict[str, str | None]:
     if isinstance(header, Tree):
         _collect_header_arg_types(header, types)
 
-    _collect_local_var_types(func_def_node.children[1:], types)
+    _collect_local_var_types(func_def_node.children[1:], types, res_path)
     return types
 
 
-def extract_property_accessor_local_var_types(pa: "PropertyAccessorInfo") -> dict[str, str | None]:
+def extract_property_accessor_local_var_types(
+    pa: "PropertyAccessorInfo", res_path: str | None = None
+) -> dict[str, str | None]:
     """Same as `extract_local_var_types`, but for a property accessor body
     (``set``/``get``) rather than a `func_def` -- without this, a setter's
     implicit value parameter (and any locals it declares) would be
@@ -415,7 +505,7 @@ def extract_property_accessor_local_var_types(pa: "PropertyAccessorInfo") -> dic
     types: dict[str, str | None] = {}
     if pa.param_name is not None:
         types[pa.param_name] = None
-    _collect_local_var_types(pa.body, types)
+    _collect_local_var_types(pa.body, types, res_path)
     return types
 
 
@@ -530,7 +620,7 @@ def _first_name_token_deep(node: Tree) -> str | None:
     return None
 
 
-def extract_fields(tree: Tree) -> list[FieldSymbol]:
+def extract_fields(tree: Tree, res_path: str | None = None) -> list[FieldSymbol]:
     fields: list[FieldSymbol] = []
     for scope, subtree in iter_scoped_subtrees(tree):
         if subtree.data == "class_var_stmt":
@@ -542,8 +632,10 @@ def extract_fields(tree: Tree) -> list[FieldSymbol]:
         name = _first_name_token_deep(subtree)
         if name is None:
             continue
+        decl = next((c for c in subtree.children if isinstance(c, Tree)), None)
+        type_name = _declared_type(decl, res_path) if decl is not None else None
         line = getattr(subtree.meta, "line", 0)
-        fields.append(FieldSymbol(name=name, line=line, kind=kind, scope=scope))
+        fields.append(FieldSymbol(name=name, line=line, kind=kind, scope=scope, type_name=type_name))
     return fields
 
 
@@ -580,6 +672,6 @@ def extract_symbols(parse_result: ParseResult) -> FileSymbols:
         extends=extract_extends(tree),
         functions=extract_functions(tree) + extract_property_accessors(tree),
         signals=extract_signals(tree),
-        fields=extract_fields(tree),
+        fields=extract_fields(tree, parse_result.res_path),
         enums=extract_enums(tree),
     )

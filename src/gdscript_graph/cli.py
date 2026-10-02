@@ -38,6 +38,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
         f"resolved signal connections: {stats.resolved_connection_count}, "
         f"unresolved: {stats.unresolved_connection_count}"
     )
+    print(
+        f"resolved scene (.tscn) signal connections: {stats.resolved_scene_connection_count}, "
+        f"unresolved: {stats.unresolved_scene_connection_count}"
+    )
     for class_name, paths in sorted(stats.duplicate_class_names.items()):
         print(
             f"warning: class_name '{class_name}' is declared in {len(paths)} files "

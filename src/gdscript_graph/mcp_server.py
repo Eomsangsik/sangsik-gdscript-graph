@@ -41,11 +41,9 @@ def _resolve_symbol_detail(
     )
     result: dict[str, Any] = {"matches": rows, "source": source}
     if match["kind"] == "function":
-        result["callers"] = [dict(r) for r in gdb.get_callers(conn, match["name"], match["res_path"], match["scope"])]
+        result["callers"] = gdb.get_callers(conn, match["name"], match["res_path"], match["scope"])
     elif match["kind"] == "signal":
-        result["handlers"] = [
-            dict(r) for r in gdb.get_signal_handlers(conn, match["name"], match["res_path"], match["scope"])
-        ]
+        result["handlers"] = gdb.get_signal_handlers(conn, match["name"], match["res_path"], match["scope"])
     return result
 
 
@@ -164,6 +162,12 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
                 "unresolved_signal_connections": conn.execute(
                     "SELECT COUNT(*) FROM unresolved_connections"
                 ).fetchone()[0],
+                "resolved_scene_connections": conn.execute(
+                    "SELECT COUNT(*) FROM scene_connections"
+                ).fetchone()[0],
+                "unresolved_scene_connections": conn.execute(
+                    "SELECT COUNT(*) FROM unresolved_scene_connections"
+                ).fetchone()[0],
                 "watching": watch_handle is not None,
                 "rebuild_pending": watch_handle.is_pending() if watch_handle is not None else False,
             }
@@ -201,7 +205,9 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         exists within `max_path_depth` hops -- collapsing what would
         otherwise be several `node` calls plus manually tracing `callees`
         by hand into one call. Useful for "how does A reach B" or "show me
-        how these N functions relate" in a single request.
+        how these N functions relate" in a single request. A function's
+        `callers` include its signal-handler registrations, exactly as the
+        `callers` tool reports them.
 
         Each name is resolved independently, with no shared `file`/`scope`
         filter across the list -- a name that's still ambiguous just gets
@@ -214,8 +220,8 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         direct call edge) won't appear there; check the signal's own
         `handlers` (or `signal_handlers`) for that side of the graph
         instead. Not exhaustive for the same reasons as `callers`/
-        `callees`: a call through an untyped variable or a class-level
-        field isn't tracked, so a path through one can't be found either.
+        `callees`: a call through an untyped variable isn't tracked, so a
+        path through one can't be found either.
         """
 
         def run(conn):
@@ -256,7 +262,14 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
 
     @mcp.tool()
     def callers(function_name: str, file: str | None = None, scope: str | None = None) -> list[dict]:
-        """List call sites that call the given function name.
+        """List everything that makes the given function run: its direct
+        call sites, plus -- marked with `via` -- its registrations as a
+        signal handler: `"connect"` (with `.connect()` in code; the caller is
+        the function containing the `.connect()`, plus `signal`) or
+        `"scene"` (connected in a .tscn scene in the Godot editor; the
+        caller is the scene file with `caller_function` null, plus
+        `signal`/`from_node`/`to_node`). Changing a handler's signature
+        breaks its `connect`/`scene` entries just like a call site.
 
         Pass `file` (a res:// path) and/or `scope` (the enclosing inner
         class name) to disambiguate when multiple declarations share a name.
@@ -265,19 +278,24 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         only the top-level declaration when it collides with an inner
         class's same-named one.
 
-        Not exhaustive: a call through an untyped variable, one typed with
-        an engine/built-in class (only a project-declared `class_name` type
-        is tracked), or a class-level field (e.g. `@onready var x: T =
-        $Node`) isn't tracked. `super.` is only tracked from a top-level
-        (not inner-class) caller. An empty result can mean "no callers" or
-        "callers exist but through an untracked receiver kind".
+        Not exhaustive: calls are tracked through typed locals, params,
+        member vars (including `:= ... as T` / `:= T.new()` and chains like
+        `self.hud.menu.f()`), autoloads, `class_name`s and `preload` consts
+        -- but not through an untyped variable (`var x = ...`), an
+        engine/built-in-typed one, a function's return value, or Godot 3's
+        string-based `connect("signal", obj, "method")`. `super.` is only
+        tracked from a top-level (not inner-class) caller. An empty result
+        can mean "no callers" or "callers exist but through an untracked
+        receiver kind".
         """
         file, scope = _blank_to_none(file), _blank_to_none(scope)
-        return _query(lambda conn: [dict(r) for r in gdb.get_callers(conn, function_name, file, scope)])
+        return _query(lambda conn: gdb.get_callers(conn, function_name, file, scope))
 
     @mcp.tool()
     def callees(function_name: str, file: str | None = None, scope: str | None = None) -> list[dict]:
-        """List functions called from within the given function.
+        """List functions the given function calls, plus the signal
+        handlers it registers with `.connect()` (marked `via: "connect"`,
+        with `signal`).
 
         Pass `file` (a res:// path) and/or `scope` (the enclosing inner
         class name) to disambiguate when multiple declarations share a name.
@@ -286,18 +304,19 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         only the top-level declaration when it collides with an inner
         class's same-named one.
 
-        Not exhaustive: a call through an untyped variable, one typed with
-        an engine/built-in class (only a project-declared `class_name` type
-        is tracked), or a class-level field (e.g. `@onready var x: T =
-        $Node`) isn't tracked. `super.` is only tracked from a top-level
-        (not inner-class) caller."""
+        Not exhaustive, for the same reasons as `callers`."""
         file, scope = _blank_to_none(file), _blank_to_none(scope)
-        return _query(lambda conn: [dict(r) for r in gdb.get_callees(conn, function_name, file, scope)])
+        return _query(lambda conn: gdb.get_callees(conn, function_name, file, scope))
 
     @mcp.tool()
     def signal_handlers(signal_name: str, file: str | None = None, scope: str | None = None) -> list[dict]:
-        """List functions connected as handlers for the given signal via
-        `.connect(...)`. Pass `file` (a res:// path) and/or `scope` (the
+        """List functions connected as handlers for the given signal, with
+        `.connect(...)` in code or in a .tscn scene in the Godot editor
+        (marked `via: "scene"`, plus `from_node`/`to_node`); `connected_in`
+        is the file the connection is made in. Without
+        `file`/`scope`, scene connections to an engine built-in signal of
+        this name (e.g. `pressed`) are included too, with `signal_file`
+        null. Pass `file` (a res:// path) and/or `scope` (the
         signal's enclosing inner class name) to disambiguate when multiple
         declarations share a name. Each result includes `signal_scope` and
         `handler_scope` so same-named signals/handlers in different scopes
@@ -308,16 +327,14 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         same-named one.
 
         Both the signal side and the handler side of `.connect(...)` are
-        tracked the same way: a bare/self reference (including one
-        inherited from an ancestor class), an autoload, or a receiver typed
-        as a project-declared `class_name` (walking its inheritance chain,
-        top-level only) -- e.g. `GameManager.card_drawn.connect(handler)`
-        and `unit.died.connect(handler)` both resolve. Not exhaustive: a
-        reference through an untyped variable, one typed with an engine/
-        built-in class, or a class-level field (e.g. `@onready var x: T =
-        $Node`) isn't tracked on either side."""
+        tracked the same way as a call receiver (see `callers`): a
+        bare/self reference (including one inherited from an ancestor
+        class), or a typed local/member/autoload/`class_name` receiver --
+        e.g. `GameManager.card_drawn.connect(handler)`,
+        `menu.closed.connect(hud.refresh)` both resolve. Not exhaustive, for
+        the same reasons as `callers`."""
         file, scope = _blank_to_none(file), _blank_to_none(scope)
-        return _query(lambda conn: [dict(r) for r in gdb.get_signal_handlers(conn, signal_name, file, scope)])
+        return _query(lambda conn: gdb.get_signal_handlers(conn, signal_name, file, scope))
 
     @mcp.tool()
     def impact(
@@ -333,8 +350,14 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         `direction="callers"` walks who (transitively) calls this function
         -- useful for "what breaks if I change this signature". Pass
         `direction="callees"` to instead walk what this function
-        (transitively) calls. Each result includes `depth`, the number of
-        hops from the seed function. Pass `file`/`scope` to disambiguate
+        (transitively) calls. Signal-handler registrations count as edges
+        too, like in `callers`/`callees`. Each result includes `depth`, the
+        number of hops from the seed function; one reached through a
+        signal registration rather than a direct call is marked `via`:
+        `"connect"`, or -- callers direction only -- `"scene"`, a .tscn
+        connection into a function in the result, with `name` null and
+        `signal`/`from_node`/`to_node`/`method` instead (a dead end:
+        nothing calls a scene). Pass `file`/`scope` to disambiguate
         when multiple declarations share a name. An empty or omitted
         `scope` means "no scope filter" (matches every scope, not just
         top-level) -- there's no way to explicitly request only the
@@ -342,8 +365,8 @@ def run_server(db_path: Path, watch: bool = True, debounce_seconds: float = DEFA
         same-named one.
 
         Not exhaustive, for the same reason as `callers`/`callees`: a call
-        through an untyped variable or a class-level field isn't tracked,
-        so the walk can't follow it either.
+        through an untyped variable isn't tracked, so the walk can't follow
+        it either.
         """
         if direction not in ("callers", "callees"):
             raise ValueError(f"direction must be 'callers' or 'callees', got {direction!r}")

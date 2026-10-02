@@ -309,10 +309,11 @@ func _on_unit_died() -> void:
     assert conns[0]["handler_fn"] == "_on_unit_died"
 
 
-def test_connect_via_unrecognized_signal_receiver_stays_unresolved(godot_project):
-    """Regression test: `<unrecognized>.signal_name.connect(handler)` (not
-    a local/autoload/class_name) must land in `unresolved_connections`
-    with `unknown_receiver`, not silently disappear or crash."""
+def test_connect_via_unrecognized_signal_receiver_still_records_the_handler(godot_project):
+    """Regression test: `<unrecognized>.signal_name.connect(handler)` must
+    not silently disappear or crash -- and since the handler itself
+    resolves, the registration is recorded (the handler must not look like
+    dead code), with the signal left unlinked rather than guessed."""
     godot_project.write("main.gd", """
 extends Node
 
@@ -323,20 +324,20 @@ func _on_died() -> void:
     pass
 """)
     conn = godot_project.build()
-    assert not signal_connections(conn)
-    unresolved = unresolved_connections(conn)
-    assert len(unresolved) == 1
-    assert unresolved[0]["signal_receiver"] == "bogus_thing"
-    assert unresolved[0]["signal_name"] == "some_signal"
-    assert unresolved[0]["reason"] == "unknown_receiver"
+    conns = signal_connections(conn)
+    assert len(conns) == 1
+    assert conns[0]["signal_name"] == "some_signal"
+    assert conns[0]["signal_file"] is None
+    assert conns[0]["handler_fn"] == "_on_died"
+    assert not unresolved_connections(conn)
 
 
-def test_connect_via_recognized_receiver_with_nonexistent_signal_stays_unresolved(godot_project):
+def test_connect_via_recognized_receiver_with_undeclared_signal_leaves_signal_unlinked(godot_project):
     """Regression test: `<typed_local>.no_such_signal.connect(handler)`
-    where the receiver resolves fine but its class (and its whole
-    inheritance chain) never declares that signal must land in
-    `unresolved_connections` with `method_not_found_in_target`, distinct
-    from an unrecognized receiver."""
+    where the receiver's class (and its whole project inheritance chain)
+    never declares that signal must not be linked to any signal symbol --
+    but it may well be an engine signal the class inherits (`tree_exited`
+    on a Node subclass), so the handler registration is still recorded."""
     godot_project.write("unit.gd", "extends Node\nclass_name Unit\nsignal died\n")
     godot_project.write("main.gd", """
 extends Node
@@ -348,13 +349,15 @@ func _on_died() -> void:
     pass
 """)
     conn = godot_project.build()
-    assert not signal_connections(conn)
-    unresolved = unresolved_connections(conn)
-    assert len(unresolved) == 1
-    assert unresolved[0]["reason"] == "method_not_found_in_target"
+    conns = signal_connections(conn)
+    assert len(conns) == 1
+    assert conns[0]["signal_name"] == "no_such_signal"
+    assert conns[0]["signal_file"] is None
+    assert conns[0]["handler_fn"] == "_on_died"
+    assert not unresolved_connections(conn)
 
 
-def test_connect_via_signal_receiver_shadowed_inside_lambda_stays_unresolved(godot_project):
+def test_connect_via_signal_receiver_shadowed_inside_lambda_does_not_link_stale_signal(godot_project):
     """Regression test: a `<receiver>.signal_name.connect(...)` made
     *inside* a lambda, through a receiver name the lambda re-declares with
     a different type than the enclosing function's same-named var, must
@@ -375,8 +378,8 @@ func _on_died() -> void:
     pass
 """)
     conn = godot_project.build()
-    assert not signal_connections(conn)
-    unresolved = unresolved_connections(conn)
-    assert len(unresolved) == 1
-    assert unresolved[0]["signal_receiver"] == "u"
-    assert unresolved[0]["reason"] == "unknown_receiver"
+    conns = signal_connections(conn)
+    assert len(conns) == 1
+    assert conns[0]["signal_name"] == "died"
+    assert conns[0]["signal_file"] is None  # not unit.gd's `died` via the stale outer type
+    assert conns[0]["handler_fn"] == "_on_died"

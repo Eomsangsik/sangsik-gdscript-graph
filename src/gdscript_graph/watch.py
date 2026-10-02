@@ -5,7 +5,13 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import (
+    EVENT_TYPE_CREATED,
+    EVENT_TYPE_DELETED,
+    EVENT_TYPE_MODIFIED,
+    EVENT_TYPE_MOVED,
+    FileSystemEventHandler,
+)
 from watchdog.observers import Observer
 
 from gdscript_graph.db import build_database
@@ -16,6 +22,19 @@ _WATCHED_SUFFIXES = (".gd", ".tscn")
 _WATCHED_NAMES = ("project.godot",)
 
 DEFAULT_DEBOUNCE_SECONDS = 2.0
+
+# Only events that can actually change a file's contents. inotify (Linux)
+# also reports plain opens and read-only closes (`opened`,
+# `closed_no_write`) -- and a rebuild itself opens and reads every watched
+# file, so reacting to those would make each rebuild schedule the next one,
+# forever, with nothing edited. A real write still always arrives as
+# `modified` (alongside its `closed`), so ignoring `closed` loses nothing.
+_REBUILD_EVENT_TYPES = frozenset({
+    EVENT_TYPE_CREATED,
+    EVENT_TYPE_DELETED,
+    EVENT_TYPE_MODIFIED,
+    EVENT_TYPE_MOVED,
+})
 
 
 def _is_watched_path(path: str) -> bool:
@@ -66,7 +85,7 @@ class _DebouncedRebuildHandler(FileSystemEventHandler):
             return self._timer is not None and self._timer.is_alive()
 
     def on_any_event(self, event) -> None:
-        if event.is_directory:
+        if event.is_directory or event.event_type not in _REBUILD_EVENT_TYPES:
             return
         paths = [event.src_path]
         dest_path = getattr(event, "dest_path", "")

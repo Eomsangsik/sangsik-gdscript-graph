@@ -194,6 +194,8 @@ def test_status_reports_counts_and_freshness(godot_project):
     assert payload["unresolved_calls"] == 0
     assert payload["resolved_signal_connections"] == 0
     assert payload["unresolved_signal_connections"] == 0
+    assert payload["resolved_scene_connections"] == 0
+    assert payload["unresolved_scene_connections"] == 0
     assert payload["project_root"] == str(godot_project.root)
     assert payload["built_at_unix"] is not None
     assert payload["seconds_since_build"] >= 0
@@ -519,3 +521,41 @@ def test_explore_ambiguous_name_excluded_from_paths(godot_project):
     assert len(payload["symbols"]["heal"]["matches"]) == 2
     assert "source" not in payload["symbols"]["heal"]
     assert payload["paths"] == {}
+
+
+def test_callers_and_impact_report_scene_connections_over_real_session(godot_project):
+    """Regression test: a handler connected only in a .tscn must show up
+    as a caller (and in `impact`) through the real stdio protocol --
+    including the null `caller_function`/`name` fields a scene entry has."""
+    godot_project.write("menu.gd", "extends Control\nfunc _on_resume_pressed():\n    pass\n")
+    godot_project.write("menu.tscn", """[gd_scene format=3]
+
+[ext_resource type="Script" path="res://menu.gd" id="1"]
+
+[node name="Menu" type="Control"]
+script = ExtResource("1")
+
+[node name="Resume" type="Button" parent="."]
+
+[connection signal="pressed" from="Resume" to="." method="_on_resume_pressed"]
+""")
+    godot_project.build()
+    db_path = godot_project.root.parent / "graph.db"
+
+    async def scenario(session):
+        callers = await session.call_tool("callers", {"function_name": "_on_resume_pressed"})
+        impact = await session.call_tool("impact", {"function_name": "_on_resume_pressed"})
+        status = await session.call_tool("status", {})
+        return callers, impact, status
+
+    callers, impact, status = _run_session(db_path, scenario)
+    assert not callers.isError and not impact.isError
+    caller = json.loads(callers.content[0].text)
+    assert (caller["via"], caller["caller_file"], caller["caller_function"], caller["signal"]) == (
+        "scene", "res://menu.tscn", None, "pressed",
+    )
+    entry = json.loads(impact.content[0].text)
+    assert (entry["via"], entry["res_path"], entry["name"], entry["depth"]) == ("scene", "res://menu.tscn", None, 1)
+    status_payload = json.loads(status.content[0].text)
+    assert status_payload["resolved_scene_connections"] == 1
+    assert status_payload["unresolved_scene_connections"] == 0

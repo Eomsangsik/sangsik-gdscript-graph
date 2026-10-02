@@ -10,11 +10,9 @@ from gdscript_graph.calls import extract_calls_and_connections
 from gdscript_graph.discovery import discover
 from gdscript_graph.parse_cache import ParseCache, load_cache, parse_all_cached, save_cache
 from gdscript_graph.resolve import (
-    build_class_name_table,
-    build_function_index,
-    build_inheritance_map,
-    build_signal_index,
+    build_project_index,
     resolve_calls,
+    resolve_scene_connections,
     resolve_signal_connections,
 )
 from gdscript_graph.symbols import (
@@ -76,7 +74,9 @@ CREATE TABLE unresolved_calls (
 CREATE TABLE signal_connections (
     id INTEGER PRIMARY KEY,
     source_symbol_id INTEGER NOT NULL,   -- function containing the .connect() call
-    signal_symbol_id INTEGER NOT NULL,
+    signal_name TEXT NOT NULL,
+    signal_symbol_id INTEGER,            -- NULL = not a project-declared signal (an engine built-in,
+                                         -- e.g. `$Button.pressed`) or one on a receiver of unknown type
     handler_symbol_id INTEGER NOT NULL,
     line INTEGER NOT NULL,
     FOREIGN KEY (source_symbol_id) REFERENCES symbols(id),
@@ -96,6 +96,36 @@ CREATE TABLE unresolved_connections (
     handler_receiver TEXT,
     handler_name TEXT,          -- NULL when the handler argument shape couldn't be parsed (e.g. a lambda)
     line INTEGER NOT NULL,
+    reason TEXT NOT NULL
+);
+
+-- Signal connections saved in a .tscn scene by the editor (`[connection
+-- signal=... from=... to=... method=...]`) -- Godot calls these handlers
+-- itself, with no `.connect()` anywhere in code.
+CREATE TABLE scene_connections (
+    id INTEGER PRIMARY KEY,
+    scene_res_path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    signal_name TEXT NOT NULL,
+    from_node TEXT NOT NULL,             -- node paths relative to the scene root ("." = root)
+    to_node TEXT NOT NULL,
+    signal_symbol_id INTEGER,            -- NULL = an engine built-in signal (e.g. Button.pressed),
+                                         -- or not found on the emitting node's script
+    handler_symbol_id INTEGER NOT NULL,
+    FOREIGN KEY (signal_symbol_id) REFERENCES symbols(id),
+    FOREIGN KEY (handler_symbol_id) REFERENCES symbols(id)
+);
+CREATE INDEX idx_scene_connections_signal ON scene_connections(signal_symbol_id);
+CREATE INDEX idx_scene_connections_handler ON scene_connections(handler_symbol_id);
+
+CREATE TABLE unresolved_scene_connections (
+    id INTEGER PRIMARY KEY,
+    scene_res_path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    signal_name TEXT NOT NULL,
+    from_node TEXT NOT NULL,
+    to_node TEXT NOT NULL,
+    method TEXT NOT NULL,
     reason TEXT NOT NULL
 );
 
@@ -137,6 +167,8 @@ class BuildStats:
     unresolved_call_count: int
     resolved_connection_count: int
     unresolved_connection_count: int
+    resolved_scene_connection_count: int
+    unresolved_scene_connection_count: int
     # class_name -> the res:// paths that declare it, only entries with 2+
     # declarers -- a duplicate class_name is silently resolved by "later
     # file wins" (see build_class_name_table) with no other signal that an
@@ -226,10 +258,8 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
                 functions=[], signals=[],
             ))
 
-    class_name_table = build_class_name_table(all_symbols)
-    function_index = build_function_index(all_symbols)
-    signal_index = build_signal_index(all_symbols)
-    inheritance_map = build_inheritance_map(all_symbols, class_name_table)
+    index = build_project_index(all_symbols, project.autoloads)
+    inheritance_map = index.inheritance_map
 
     class_name_declarers: dict[str, list[str]] = {}
     for fs in all_symbols:
@@ -322,19 +352,15 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
             local_var_types: dict[tuple[str | None, str], dict[str, str | None]] = {}
             lambda_shadowed_names: dict[tuple[str | None, str], set[str]] = {}
             for fd in iter_function_defs(pr.tree):
-                local_var_types[(fd.scope, fd.name)] = extract_local_var_types(fd.node)
+                local_var_types[(fd.scope, fd.name)] = extract_local_var_types(fd.node, fs.res_path)
                 lambda_shadowed_names[(fd.scope, fd.name)] = extract_lambda_shadowed_names(fd.node)
             for pa in iter_property_accessor_defs(pr.tree):
-                local_var_types[(pa.scope, pa.name)] = extract_property_accessor_local_var_types(pa)
+                local_var_types[(pa.scope, pa.name)] = extract_property_accessor_local_var_types(pa, fs.res_path)
                 lambda_shadowed_names[(pa.scope, pa.name)] = extract_property_accessor_lambda_shadowed_names(pa)
 
-            resolved, unresolved = resolve_calls(
-                fs, raw_calls, class_name_table, project.autoloads, function_index,
-                inheritance_map, local_var_types, lambda_shadowed_names,
-            )
+            resolved, unresolved = resolve_calls(fs, raw_calls, index, local_var_types, lambda_shadowed_names)
             resolved_conns, unresolved_conns = resolve_signal_connections(
-                fs, raw_connections, class_name_table, project.autoloads, function_index, inheritance_map,
-                local_var_types, lambda_shadowed_names, signal_index,
+                fs, raw_connections, index, local_var_types, lambda_shadowed_names,
             )
         except RecursionError:
             # Same pathological-nesting hazard as the extract_symbols guard
@@ -378,21 +404,22 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
 
         for rc in resolved_conns:
             # A bare/self/inherited `<signal>.connect(...)` reference is
-            # always declared in the same *scope* as the connect() call;
-            # a signal reached through a chained receiver (autoload/
-            # class_name/local) is always top-level (rc.signal_scope is
-            # None either way it was resolved) -- rc.signal_scope tracks
-            # which one applies, rc.signal_res_path which file declares it
-            # (see resolve.py).
+            # always declared in the same *scope* as the connect() call; a
+            # signal reached through a receiver is declared wherever that
+            # receiver's type says -- rc.signal_scope/rc.signal_res_path
+            # carry whichever applies (see resolve.py).
             source_id = symbol_lookup.get((rc.source_res_path, rc.source_scope, rc.source_function))
-            signal_id = symbol_lookup.get((rc.signal_res_path, rc.signal_scope, rc.signal_name))
+            signal_id = (
+                symbol_lookup.get((rc.signal_res_path, rc.signal_scope, rc.signal_name))
+                if rc.signal_res_path is not None else None
+            )
             handler_id = symbol_lookup.get((rc.handler_res_path, rc.handler_scope, rc.handler_function))
-            if source_id is None or signal_id is None or handler_id is None:
+            if source_id is None or handler_id is None:
                 continue
             conn.execute(
-                "INSERT INTO signal_connections (source_symbol_id, signal_symbol_id, handler_symbol_id, line) "
-                "VALUES (?, ?, ?, ?)",
-                (source_id, signal_id, handler_id, rc.line),
+                "INSERT INTO signal_connections "
+                "(source_symbol_id, signal_name, signal_symbol_id, handler_symbol_id, line) VALUES (?, ?, ?, ?, ?)",
+                (source_id, rc.signal_name, signal_id, handler_id, rc.line),
             )
             resolved_connection_count += 1
         for uc in unresolved_conns:
@@ -407,6 +434,38 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
             )
             unresolved_connection_count += 1
 
+    resolved_scene_connection_count = 0
+    unresolved_scene_connection_count = 0
+    scenes = project.scenes
+    for scene_file in project.scene_files if scenes is not None else ():
+        scene = scenes.get(project.to_res_path(scene_file))
+        if scene is None:
+            continue
+        resolved_scene_conns, unresolved_scene_conns = resolve_scene_connections(scene, scenes, index)
+        for sc in resolved_scene_conns:
+            handler_id = symbol_lookup.get((sc.handler_res_path, None, sc.handler_function))
+            if handler_id is None:
+                continue
+            signal_id = (
+                symbol_lookup.get((sc.signal_res_path, None, sc.signal_name))
+                if sc.signal_res_path is not None else None
+            )
+            conn.execute(
+                "INSERT INTO scene_connections "
+                "(scene_res_path, line, signal_name, from_node, to_node, signal_symbol_id, handler_symbol_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, sc.to_node, signal_id, handler_id),
+            )
+            resolved_scene_connection_count += 1
+        for uc in unresolved_scene_conns:
+            conn.execute(
+                "INSERT INTO unresolved_scene_connections "
+                "(scene_res_path, line, signal_name, from_node, to_node, method, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (uc.scene_res_path, uc.line, uc.signal_name, uc.from_node, uc.to_node, uc.method, uc.reason),
+            )
+            unresolved_scene_connection_count += 1
+
     return BuildStats(
         file_count=len(parse_results),
         parse_error_count=parse_error_count,
@@ -418,6 +477,8 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
         unresolved_call_count=unresolved_call_count,
         resolved_connection_count=resolved_connection_count,
         unresolved_connection_count=unresolved_connection_count,
+        resolved_scene_connection_count=resolved_scene_connection_count,
+        unresolved_scene_connection_count=unresolved_scene_connection_count,
         duplicate_class_names=duplicate_class_names,
         parse_cache_hits=cache_hits,
         parse_cache_misses=len(parse_results) - cache_hits,
@@ -486,77 +547,180 @@ def find_symbol_locations(
     return conn.execute(query, params).fetchall()
 
 
-def get_callers(
-    conn: sqlite3.Connection, function_name: str, res_path: str | None = None, scope: str | None = None
-) -> list[sqlite3.Row]:
-    query = """
-        SELECT src.res_path AS caller_file, src.scope AS caller_scope, src.name AS caller_function,
-               c.line AS call_line
-        FROM calls c
-        JOIN symbols src ON src.id = c.source_symbol_id
-        JOIN symbols tgt ON tgt.id = c.target_symbol_id
-        WHERE tgt.name = ?
-    """
-    params: list[str] = [function_name]
+def _symbol_filter(alias: str, name: str, res_path: str | None, scope: str | None) -> tuple[str, list[str]]:
+    """SQL condition (and its params) matching symbols named `name` under
+    table alias `alias`, optionally narrowed to one file and/or scope."""
+    condition = f"{alias}.name = ?"
+    params = [name]
     if res_path is not None:
-        query += " AND tgt.res_path = ?"
+        condition += f" AND {alias}.res_path = ?"
         params.append(res_path)
     if scope is not None:
-        query += " AND tgt.scope = ?"
+        condition += f" AND {alias}.scope = ?"
         params.append(scope)
-    query += " ORDER BY src.res_path, c.line"
-    return conn.execute(query, params).fetchall()
+    return condition, params
+
+
+def get_callers(
+    conn: sqlite3.Connection, function_name: str, res_path: str | None = None, scope: str | None = None
+) -> list[dict]:
+    """Everything that makes the given function run: direct calls, and its
+    registrations as a signal handler -- a `<signal>.connect(<function>)`
+    in code (`via: "connect"`, with the function containing the
+    `.connect()` as the caller) or a `[connection]` saved in a .tscn scene
+    (`via: "scene"`, with the scene file as the caller and no caller
+    function). A signal handler is rarely called directly, so without the
+    latter two it would look like dead code -- and changing its signature
+    breaks exactly those connection sites. Only those two kinds carry
+    `via`; a row without it is a direct call (the common case, kept as
+    small as before for a function with hundreds of call sites)."""
+    condition, params = _symbol_filter("tgt", function_name, res_path, scope)
+    rows: list[dict] = [
+        {
+            "caller_file": r["res_path"], "caller_scope": r["scope"], "caller_function": r["name"],
+            "call_line": r["line"],
+        }
+        for r in conn.execute(f"""
+            SELECT src.res_path, src.scope, src.name, c.line
+            FROM calls c
+            JOIN symbols src ON src.id = c.source_symbol_id
+            JOIN symbols tgt ON tgt.id = c.target_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows += [
+        {
+            "caller_file": r["res_path"], "caller_scope": r["scope"], "caller_function": r["name"],
+            "call_line": r["line"], "via": "connect", "signal": r["signal_name"],
+        }
+        for r in conn.execute(f"""
+            SELECT src.res_path, src.scope, src.name, sc.line, sc.signal_name
+            FROM signal_connections sc
+            JOIN symbols src ON src.id = sc.source_symbol_id
+            JOIN symbols tgt ON tgt.id = sc.handler_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows += [
+        {
+            "caller_file": r["scene_res_path"], "caller_scope": None, "caller_function": None,
+            "call_line": r["line"], "via": "scene", "signal": r["signal_name"],
+            "from_node": r["from_node"], "to_node": r["to_node"],
+        }
+        for r in conn.execute(f"""
+            SELECT sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, sc.to_node
+            FROM scene_connections sc
+            JOIN symbols tgt ON tgt.id = sc.handler_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows.sort(key=lambda r: (r["caller_file"], r["call_line"]))
+    return rows
 
 
 def get_callees(
     conn: sqlite3.Connection, function_name: str, res_path: str | None = None, scope: str | None = None
-) -> list[sqlite3.Row]:
-    query = """
-        SELECT tgt.res_path AS callee_file, tgt.scope AS callee_scope, tgt.name AS callee_function,
-               c.line AS call_line
-        FROM calls c
-        JOIN symbols src ON src.id = c.source_symbol_id
-        JOIN symbols tgt ON tgt.id = c.target_symbol_id
-        WHERE src.name = ?
-    """
-    params: list[str] = [function_name]
-    if res_path is not None:
-        query += " AND src.res_path = ?"
-        params.append(res_path)
-    if scope is not None:
-        query += " AND src.scope = ?"
-        params.append(scope)
-    query += " ORDER BY tgt.res_path, c.line"
-    return conn.execute(query, params).fetchall()
+) -> list[dict]:
+    """Functions the given function calls, and the signal handlers it
+    registers with `<signal>.connect(<handler>)` (marked `via: "connect"`)
+    -- code that runs because of it either way."""
+    condition, params = _symbol_filter("src", function_name, res_path, scope)
+    rows: list[dict] = [
+        {
+            "callee_file": r["res_path"], "callee_scope": r["scope"], "callee_function": r["name"],
+            "call_line": r["line"],
+        }
+        for r in conn.execute(f"""
+            SELECT tgt.res_path, tgt.scope, tgt.name, c.line
+            FROM calls c
+            JOIN symbols src ON src.id = c.source_symbol_id
+            JOIN symbols tgt ON tgt.id = c.target_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows += [
+        {
+            "callee_file": r["res_path"], "callee_scope": r["scope"], "callee_function": r["name"],
+            "call_line": r["line"], "via": "connect", "signal": r["signal_name"],
+        }
+        for r in conn.execute(f"""
+            SELECT h.res_path, h.scope, h.name, sc.line, sc.signal_name
+            FROM signal_connections sc
+            JOIN symbols src ON src.id = sc.source_symbol_id
+            JOIN symbols h ON h.id = sc.handler_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows.sort(key=lambda r: (r["callee_file"], r["call_line"]))
+    return rows
 
 
 def get_signal_handlers(
     conn: sqlite3.Connection, signal_name: str, res_path: str | None = None, scope: str | None = None
-) -> list[sqlite3.Row]:
-    query = """
-        SELECT sig.res_path AS signal_file, sig.scope AS signal_scope,
-               h.res_path AS handler_file, h.scope AS handler_scope, h.name AS handler_function,
-               sc.line AS connect_line
-        FROM signal_connections sc
-        JOIN symbols sig ON sig.id = sc.signal_symbol_id
-        JOIN symbols h ON h.id = sc.handler_symbol_id
-        WHERE sig.name = ?
-    """
-    params: list[str] = [signal_name]
-    if res_path is not None:
-        query += " AND sig.res_path = ?"
-        params.append(res_path)
-    if scope is not None:
-        query += " AND sig.scope = ?"
-        params.append(scope)
-    query += " ORDER BY h.res_path, sc.line"
-    return conn.execute(query, params).fetchall()
+) -> list[dict]:
+    """Functions connected to the given signal -- with `.connect()` in code,
+    or in a .tscn scene (marked `via: "scene"`, plus `from_node`/`to_node`).
+    `connected_in` is the file the connection is made in. Without a `res_path`/`scope`
+    filter, connections to a signal of that name that isn't
+    project-declared (an engine built-in like `pressed`, or one on a
+    receiver of unknown type) are included too, with
+    `signal_file`/`signal_scope` None."""
+    condition, params = _symbol_filter("sig", signal_name, res_path, scope)
+    if res_path is None and scope is None:
+        # Match by the recorded name, so unlinked (engine) signals count too.
+        condition, params = "connection.signal_name = ?", [signal_name]
+    rows: list[dict] = [
+        {
+            "signal_file": r["signal_file"], "signal_scope": r["signal_scope"],
+            "handler_file": r["handler_file"], "handler_scope": r["handler_scope"],
+            "handler_function": r["handler_function"], "connect_line": r["line"],
+            "connected_in": r["connected_in"],
+        }
+        for r in conn.execute(f"""
+            SELECT sig.res_path AS signal_file, sig.scope AS signal_scope,
+                   h.res_path AS handler_file, h.scope AS handler_scope, h.name AS handler_function,
+                   connection.line, src.res_path AS connected_in
+            FROM signal_connections connection
+            LEFT JOIN symbols sig ON sig.id = connection.signal_symbol_id
+            JOIN symbols h ON h.id = connection.handler_symbol_id
+            JOIN symbols src ON src.id = connection.source_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows += [
+        {
+            "signal_file": r["signal_file"], "signal_scope": r["signal_scope"],
+            "handler_file": r["handler_file"], "handler_scope": r["handler_scope"],
+            "handler_function": r["handler_function"], "connect_line": r["line"],
+            "via": "scene", "connected_in": r["scene_res_path"],
+            "from_node": r["from_node"], "to_node": r["to_node"],
+        }
+        for r in conn.execute(f"""
+            SELECT sig.res_path AS signal_file, sig.scope AS signal_scope,
+                   h.res_path AS handler_file, h.scope AS handler_scope, h.name AS handler_function,
+                   connection.line, connection.scene_res_path, connection.from_node, connection.to_node
+            FROM scene_connections connection
+            LEFT JOIN symbols sig ON sig.id = connection.signal_symbol_id
+            JOIN symbols h ON h.id = connection.handler_symbol_id
+            WHERE {condition}
+        """, params)
+    ]
+    rows.sort(key=lambda r: (r["handler_file"], r["connected_in"], r["connect_line"]))
+    return rows
 
 
 def _load_call_edges(conn: sqlite3.Connection) -> list[tuple[int, int]]:
     return [
         (row["source_symbol_id"], row["target_symbol_id"])
         for row in conn.execute("SELECT source_symbol_id, target_symbol_id FROM calls")
+    ]
+
+
+def _load_connect_edges(conn: sqlite3.Connection) -> list[tuple[int, int]]:
+    """(function containing a `.connect()`, the handler it registers)."""
+    return [
+        (row["source_symbol_id"], row["handler_symbol_id"])
+        for row in conn.execute("SELECT source_symbol_id, handler_symbol_id FROM signal_connections")
     ]
 
 
@@ -582,8 +746,13 @@ def _bfs_symbols(
     max_depth: int,
     reverse: bool,
 ) -> list[dict]:
-    """BFS over the `calls` edge list from the seed symbol(s). `reverse`
-    walks caller-of edges (for callers_transitive) instead of callee edges.
+    """BFS from the seed symbol(s) over call edges and `.connect()` edges
+    (connecting function -> handler). `reverse` walks them backwards (for
+    callers_transitive), and then also reports the .tscn scene connections
+    into any function reached -- terminal entries, since a scene isn't a
+    function with callers of its own. An entry reached through a connect
+    edge or a scene connection says so in `via` ("connect" / "scene"); one
+    without `via` was reached through a direct call.
 
     Runs one BFS per seed and merges by minimum depth, rather than a single
     multi-source BFS seeded with every match at once -- when `function_name`
@@ -597,46 +766,82 @@ def _bfs_symbols(
     case is still excluded from its own run, but a same-named seed reached
     via a genuine edge from a *different* seed is a real result and must be
     reported."""
-    adjacency: dict[int, set[int]] = {}
-    for src, tgt in _load_call_edges(conn):
-        a, b = (tgt, src) if reverse else (src, tgt)
-        adjacency.setdefault(a, set()).add(b)
+    # neighbor -> edge kind; a direct call wins over a connect between the same pair.
+    adjacency: dict[int, dict[int, str | None]] = {}
+    for kind, edges in (("connect", _load_connect_edges(conn)), (None, _load_call_edges(conn))):
+        for src, tgt in edges:
+            a, b = (tgt, src) if reverse else (src, tgt)
+            adjacency.setdefault(a, {})[b] = kind
 
     seeds = _seed_symbol_ids(conn, function_name, res_path, scope)
-    best_depth: dict[int, int] = {}
+    best: dict[int, tuple[int, str | None]] = {}  # symbol id -> (min depth, via)
+    reached_at: dict[int, int] = {}  # every reached function, seeds included -> min depth
     for seed in seeds:
-        visited: dict[int, int] = {seed: 0}
+        visited: dict[int, tuple[int, str | None]] = {seed: (0, None)}
         frontier = [seed]
         depth = 0
         while frontier and depth < max_depth:
             depth += 1
             next_frontier: list[int] = []
             for sid in frontier:
-                for neighbor in adjacency.get(sid, ()):
+                for neighbor, kind in adjacency.get(sid, {}).items():
                     if neighbor not in visited:
-                        visited[neighbor] = depth
+                        visited[neighbor] = (depth, kind)
                         next_frontier.append(neighbor)
             frontier = next_frontier
-        for node, hop in visited.items():
+        for node, (hop, kind) in visited.items():
+            if node not in reached_at or hop < reached_at[node]:
+                reached_at[node] = hop
             if node == seed:
                 continue
-            if node not in best_depth or hop < best_depth[node]:
-                best_depth[node] = hop
+            if node not in best or hop < best[node][0]:
+                best[node] = (hop, kind)
 
     results = []
-    for sid, hop in best_depth.items():
+    for sid, (hop, kind) in best.items():
         row = conn.execute(
             "SELECT res_path, name, scope, line FROM symbols WHERE id = ?", (sid,)
         ).fetchone()
         if row is not None:
-            results.append({
+            entry = {
                 "res_path": row["res_path"],
                 "name": row["name"],
                 "scope": row["scope"],
                 "line": row["line"],
                 "depth": hop,
+            }
+            if kind is not None:
+                entry["via"] = kind
+            results.append(entry)
+
+    if reverse:
+        scene_best: dict[int, tuple[int, sqlite3.Row]] = {}
+        for sid, hop in reached_at.items():
+            if hop + 1 > max_depth:
+                continue
+            for sc in conn.execute(
+                "SELECT sc.id, sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, sc.to_node, "
+                "h.name AS method FROM scene_connections sc JOIN symbols h ON h.id = sc.handler_symbol_id "
+                "WHERE sc.handler_symbol_id = ?",
+                (sid,),
+            ):
+                if sc["id"] not in scene_best or hop + 1 < scene_best[sc["id"]][0]:
+                    scene_best[sc["id"]] = (hop + 1, sc)
+        for hop, sc in scene_best.values():
+            results.append({
+                "res_path": sc["scene_res_path"],
+                "name": None,
+                "scope": None,
+                "line": sc["line"],
+                "depth": hop,
+                "via": "scene",
+                "signal": sc["signal_name"],
+                "from_node": sc["from_node"],
+                "to_node": sc["to_node"],
+                "method": sc["method"],
             })
-    results.sort(key=lambda r: (r["depth"], r["res_path"], r["name"]))
+
+    results.sort(key=lambda r: (r["depth"], r["res_path"], r["name"] or "", r["line"]))
     return results
 
 
@@ -714,7 +919,8 @@ def get_callees_transitive(
 
 REQUIRED_TABLES = {
     "files", "symbols", "calls", "unresolved_calls",
-    "signal_connections", "unresolved_connections", "meta",
+    "signal_connections", "unresolved_connections",
+    "scene_connections", "unresolved_scene_connections", "meta",
 }
 
 
@@ -731,7 +937,7 @@ def validate_schema(conn: sqlite3.Connection) -> None:
     missing = REQUIRED_TABLES - existing
     if missing:
         raise ValueError(
-            "not a valid gdscript-graph database (missing tables: "
-            f"{', '.join(sorted(missing))}). Run `gdscript-graph build <project_dir>` "
-            "first, or check the db path."
+            "not a valid gdscript-graph database, or one built by an older version "
+            f"(missing tables: {', '.join(sorted(missing))}). Run `gdscript-graph build "
+            "<project_dir>` to (re)build it, or check the db path."
         )

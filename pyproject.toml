@@ -1,14 +1,33 @@
 [project]
 name = "sangsik-gdscript-graph"
-version = "0.1.0"
+version = "0.2.0"
 description = "GDScript function-level call graph indexer + MCP server"
+readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "eomsangsik" }]
 requires-python = ">=3.10"
+keywords = ["godot", "gdscript", "mcp", "call-graph", "static-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Games/Entertainment",
+]
 dependencies = [
-    "gdtoolkit>=4.3.0",
-    "mcp>=1.0.0",
+    # 4.5 is the first release that parses Godot 4.5's abstract methods.
+    "gdtoolkit>=4.5.0",
+    # FastMCP (`mcp.server.fastmcp`) is gone in mcp 2.x, and releases before
+    # 1.14 crash on startup building this server's tool schemas.
+    "mcp>=1.14.0,<2",
     "watchdog>=4.0.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/Eomsangsik/sangsik-gdscript-graph"
+Changelog = "https://github.com/Eomsangsik/sangsik-gdscript-graph/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Eomsangsik/sangsik-gdscript-graph/issues"
 
 [project.scripts]
 gdscript-graph = "gdscript_graph.cli:main"
@@ -18,7 +37,7 @@ dev = ["pytest>=8.0.0"]
 benchmark = ["tiktoken>=0.7.0"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # SPDX `license` string + `license-files`
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
