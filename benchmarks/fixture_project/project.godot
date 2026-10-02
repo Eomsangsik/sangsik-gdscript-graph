@@ -1,0 +1,9 @@
+[application]
+config/name="Benchmark Fixture"
+
+[autoload]
+GameManager="*res://autoloads/game_manager.gd"
+EquipmentManager="*res://autoloads/equipment_manager.gd"
+InventoryManager="*res://autoloads/inventory_manager.gd"
+DamageCalculator="*res://autoloads/damage_calculator.gd"
+Logger="*res://autoloads/logger.gd"
