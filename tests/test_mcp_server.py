@@ -140,14 +140,14 @@ func _on_died() -> void:
     callees_result = _run_session(db_path, lambda session: session.call_tool("callees", {"function_name": "run"}))
     assert not callees_result.isError
     callees_payload = json.loads(callees_result.content[0].text)
-    assert callees_payload["callee_function"] == "helper"
+    assert [e["function"] for e in callees_payload["by_file"]["res://x.gd"]] == ["helper", "_on_died"]
 
     handlers_result = _run_session(
         db_path, lambda session: session.call_tool("signal_handlers", {"signal_name": "died"})
     )
     assert not handlers_result.isError
     handlers_payload = json.loads(handlers_result.content[0].text)
-    assert handlers_payload["handler_function"] == "_on_died"
+    assert handlers_payload["by_file"]["res://x.gd"][0]["function"] == "_on_died"
 
 
 def test_callers_blank_scope_behaves_like_omitted(godot_project):
@@ -172,11 +172,16 @@ func run_outer() -> void:
     godot_project.build()
     db_path = godot_project.root.parent / "graph.db"
 
-    omitted = _run_session(db_path, lambda session: session.call_tool("callers", {"function_name": "setup"}))
-    blank = _run_session(
-        db_path, lambda session: session.call_tool("callers", {"function_name": "setup", "scope": ""})
+    # No watcher: a rebuild it schedules (macOS can replay the writes just
+    # made as live events) would mark one of the two results `stale`.
+    omitted = _run_session(
+        db_path, lambda session: session.call_tool("callers", {"function_name": "setup"}), ["--no-watch"]
     )
-    assert len(blank.content) == len(omitted.content) == 2
+    blank = _run_session(
+        db_path, lambda session: session.call_tool("callers", {"function_name": "setup", "scope": ""}), ["--no-watch"]
+    )
+    assert json.loads(blank.content[0].text) == json.loads(omitted.content[0].text)
+    assert json.loads(omitted.content[0].text)["total"] == 2
 
 
 def test_status_reports_counts_and_freshness(godot_project):
@@ -202,6 +207,27 @@ def test_status_reports_counts_and_freshness(godot_project):
     assert payload["watching"] is True
 
 
+def test_two_servers_on_one_db_elect_a_single_rebuilding_leader(godot_project):
+    """Regression test: two editor sessions on one project start two
+    servers on the same db -- only one may watch and rebuild."""
+    godot_project.write("x.gd", "extends Node\nfunc a():\n    pass\n")
+    godot_project.build()
+    db_path = godot_project.root.parent / "graph.db"
+
+    async def run():
+        params = StdioServerParameters(command=sys.executable, args=["-m", "gdscript_graph.cli", "mcp", str(db_path)])
+        roles = []
+        async with stdio_client(params) as (read1, write1), ClientSession(read1, write1) as first:
+            await first.initialize()
+            roles.append(json.loads((await first.call_tool("status", {})).content[0].text)["watch_role"])
+            async with stdio_client(params) as (read2, write2), ClientSession(read2, write2) as second:
+                await second.initialize()
+                roles.append(json.loads((await second.call_tool("status", {})).content[0].text)["watch_role"])
+        return roles
+
+    assert asyncio.run(run()) == ["leader", "follower"]
+
+
 def test_status_watching_false_and_rebuild_pending_false_when_watch_disabled(godot_project):
     godot_project.write("x.gd", "extends Node\nfunc a():\n    pass\n")
     godot_project.build()
@@ -212,6 +238,7 @@ def test_status_watching_false_and_rebuild_pending_false_when_watch_disabled(god
     )
     payload = json.loads(result.content[0].text)
     assert payload["watching"] is False
+    assert payload["watch_role"] is None
     assert payload["rebuild_pending"] is False
 
 
@@ -276,9 +303,10 @@ func take_damage() -> void:
 
     assert len(payload["matches"]) == 1
     assert payload["source"]["text"] == "func check_death() -> void:\n    pass\n"
-    assert payload["callers"] == [
-        {"caller_file": "res://player.gd", "caller_scope": None, "caller_function": "take_damage", "call_line": 8}
-    ]
+    assert payload["callers"] == {
+        "total": 1, "next_offset": None,
+        "by_file": {"res://player.gd": [{"function": "take_damage", "line": 8}]},
+    }
 
 
 def test_node_returns_handlers_for_a_signal(godot_project):
@@ -300,8 +328,8 @@ func _on_died() -> void:
     payload = json.loads(result.content[0].text)
 
     assert payload["source"]["text"] == "signal died"
-    assert len(payload["handlers"]) == 1
-    assert payload["handlers"][0]["handler_function"] == "_on_died"
+    assert payload["handlers"]["total"] == 1
+    assert payload["handlers"]["by_file"]["res://player.gd"][0]["function"] == "_on_died"
 
 
 def test_node_ambiguous_name_returns_matches_only_no_source(godot_project):
@@ -339,7 +367,9 @@ def test_node_nonexistent_name_returns_empty_matches(godot_project):
     godot_project.build()
     db_path = godot_project.root.parent / "graph.db"
 
-    result = _run_session(db_path, lambda session: session.call_tool("node", {"name": "does_not_exist"}))
+    result = _run_session(
+        db_path, lambda session: session.call_tool("node", {"name": "does_not_exist"}), ["--no-watch"]
+    )
     payload = json.loads(result.content[0].text)
     assert payload == {"matches": []}
 
@@ -405,7 +435,7 @@ def test_files_lists_all_indexed_files_with_symbol_counts(godot_project):
     db_path = godot_project.root.parent / "graph.db"
 
     result = _run_session(db_path, lambda session: session.call_tool("files", {}))
-    rows = result.structuredContent["result"]
+    rows = result.structuredContent["files"]
     by_path = {r["res_path"]: r for r in rows}
 
     assert set(by_path) == {"res://player.gd", "res://enemies/goblin.gd"}
@@ -424,7 +454,7 @@ def test_files_prefix_narrows_to_a_subdirectory(godot_project):
     result = _run_session(
         db_path, lambda session: session.call_tool("files", {"prefix": "res://enemies/"})
     )
-    rows = result.structuredContent["result"]
+    rows = result.structuredContent["files"]
     assert {r["res_path"] for r in rows} == {"res://enemies/goblin.gd", "res://enemies/orc.gd"}
 
 
@@ -435,10 +465,10 @@ def test_files_reports_parse_error_for_unparseable_file(godot_project):
     db_path = godot_project.root.parent / "graph.db"
 
     result = _run_session(db_path, lambda session: session.call_tool("files", {}))
-    rows = result.structuredContent["result"]
+    rows = result.structuredContent["files"]
     by_path = {r["res_path"]: r for r in rows}
     assert by_path["res://broken.gd"]["parse_error"] is not None
-    assert by_path["res://good.gd"]["parse_error"] is None
+    assert "parse_error" not in by_path["res://good.gd"]
 
 
 def test_explore_finds_multi_hop_call_path_between_two_functions(godot_project):
@@ -467,7 +497,9 @@ func unrelated() -> void:
 
     assert set(payload["symbols"]) == {"take_damage", "check_death"}
     assert payload["symbols"]["take_damage"]["source"]["text"].startswith("func take_damage")
-    assert payload["symbols"]["check_death"]["callers"][0]["caller_function"] == "apply_damage"
+    assert payload["symbols"]["check_death"]["callers"]["by_file"]["res://player.gd"] == [
+        {"function": "apply_damage", "line": 8}
+    ]
 
     path = payload["paths"]["take_damage -> check_death"]
     assert [n["name"] for n in path] == ["take_damage", "apply_damage", "check_death"]
@@ -550,12 +582,93 @@ script = ExtResource("1")
 
     callers, impact, status = _run_session(db_path, scenario)
     assert not callers.isError and not impact.isError
-    caller = json.loads(callers.content[0].text)
-    assert (caller["via"], caller["caller_file"], caller["caller_function"], caller["signal"]) == (
-        "scene", "res://menu.tscn", None, "pressed",
-    )
-    entry = json.loads(impact.content[0].text)
-    assert (entry["via"], entry["res_path"], entry["name"], entry["depth"]) == ("scene", "res://menu.tscn", None, 1)
+    [caller] = json.loads(callers.content[0].text)["by_file"]["res://menu.tscn"]
+    assert (caller["via"], caller.get("function"), caller["signal"]) == ("scene", None, "pressed")
+    [entry] = json.loads(impact.content[0].text)["by_file"]["res://menu.tscn"]
+    assert (entry["via"], entry.get("name"), entry["depth"]) == ("scene", None, 1)
     status_payload = json.loads(status.content[0].text)
     assert status_payload["resolved_scene_connections"] == 1
     assert status_payload["unresolved_scene_connections"] == 0
+
+
+def test_list_tools_page_large_results_instead_of_returning_everything(godot_project):
+    """Regression test: list tools returned every row at once -- a common
+    helper's ~2,300 call sites came to ~100k tokens, far past what an MCP
+    client accepts (Claude Code truncates at ~25k). They return a page
+    (default 50) with `total`/`next_offset`, grouped by file."""
+    godot_project.write("util.gd", "class_name Util\nextends Node\nstatic func t(x):\n    return x\n")
+    for i in range(12):
+        body = "".join(f"func f{j}():\n    Util.t({j})\n" for j in range(10))
+        godot_project.write(f"screens/s{i}.gd", f"extends Node\n{body}")
+    godot_project.write("a.gd", "extends Node\nfunc heal():\n    pass\nfunc run():\n    heal()\n")
+    godot_project.write("b.gd", "extends Node\nfunc heal():\n    pass\nfunc run():\n    heal()\n")
+    godot_project.build()
+    db_path = godot_project.root.parent / "graph.db"
+
+    async def scenario(session):
+        async def call(tool, args):
+            result = await session.call_tool(tool, args)
+            assert not result.isError, result.content
+            return json.loads(result.content[0].text)
+
+        first = await call("callers", {"function_name": "t"})
+        assert (first["total"], first["next_offset"]) == (120, 50)
+        assert sum(len(v) for v in first["by_file"].values()) == 50
+        seen = []
+        offset = 0
+        while offset is not None:
+            page = await call("callers", {"function_name": "t", "offset": offset, "limit": 40})
+            seen += [(f, e["function"]) for f, entries in page["by_file"].items() for e in entries]
+            offset = page["next_offset"]
+        assert len(seen) == len(set(seen)) == 120
+
+        node = await call("node", {"name": "t"})
+        assert (node["callers"]["total"], node["callers"]["next_offset"]) == (120, 20)
+
+        merged = await call("callers", {"function_name": "heal"})
+        assert merged["declarations"] == 2
+        assert {(f, e["target_file"]) for f, entries in merged["by_file"].items() for e in entries} == {
+            ("res://a.gd", "res://a.gd"), ("res://b.gd", "res://b.gd"),
+        }
+
+        ambiguous = await call("impact", {"function_name": "heal"})
+        assert ambiguous["ambiguous"] is True
+        assert set(ambiguous["by_file"]) == {"res://a.gd", "res://b.gd"}
+        picked = await call("impact", {"function_name": "heal", "file": "res://a.gd"})
+        assert "ambiguous" not in picked
+        assert picked["by_file"] == {"res://a.gd": [{"name": "run", "line": 4, "depth": 1}]}
+
+        files = await call("files", {"limit": 5})
+        assert (files["total"], len(files["files"])) == (15, 5)
+        assert files["directories"] == {"res://screens/": 12}
+        narrowed = await call("files", {"prefix": "res://screens/"})
+        assert narrowed["total"] == 12 and "directories" not in narrowed
+
+    _run_session(db_path, scenario)
+
+
+def test_results_say_stale_while_a_rebuild_is_pending(godot_project):
+    """A query answered between an edit and the rebuild it triggers reflects
+    the old code -- every result must say so, not only `status`."""
+    godot_project.write("x.gd", "extends Node\nfunc a():\n    pass\n")
+    godot_project.build()
+    db_path = godot_project.root.parent / "graph.db"
+
+    async def scenario(session):
+        async def search():
+            return json.loads((await session.call_tool("search", {"query": "a"})).content[0].text)
+
+        for _ in range(50):  # let the startup freshness check settle
+            if "stale" not in await search():
+                break
+            await asyncio.sleep(0.1)
+        assert "stale" not in await search()
+
+        godot_project.write("x.gd", "extends Node\nfunc a():\n    pass\nfunc b():\n    pass\n")
+        for _ in range(50):
+            if (await search()).get("stale") is True:
+                return
+            await asyncio.sleep(0.1)
+        raise AssertionError("no result was marked stale during the debounce window")
+
+    _run_session(db_path, scenario, extra_args=["--debounce-ms", "5000"])

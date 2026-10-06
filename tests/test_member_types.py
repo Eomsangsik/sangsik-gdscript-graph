@@ -210,7 +210,8 @@ func run() -> void:
 """)
     conn = godot_project.build()
     assert _targets(conn, "run") == set()
-    assert _unresolved_reason(conn, "start", "run") == "unknown_receiver"
+    # Recorded as a call into the engine's Timer.start, not a missed one.
+    assert _unresolved_reason(conn, "start", "run") == "engine_receiver"
 
 
 def test_const_preload_alias_resolves_static_and_instance_calls(godot_project):

@@ -193,8 +193,3 @@ class SceneIndex:
                 return self.script_for_node(owner.instance, "/".join(parts[depth:]), visited)
         return None
 
-
-def find_scene_files(root: Path) -> list[Path]:
-    # Sorted by POSIX-style relative path, same as `find_gd_files`, so the
-    # build is deterministic across host OSes.
-    return sorted(root.rglob("*.tscn"), key=lambda p: p.relative_to(root).as_posix())

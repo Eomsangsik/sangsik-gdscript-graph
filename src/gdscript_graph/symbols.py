@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from lark import Token, Tree
 
 from gdscript_graph.parsing import ParseResult
+from gdscript_graph.receivers import CallType, call_type
 
 
 @dataclass
@@ -14,6 +15,7 @@ class FunctionSymbol:
     line: int
     is_static: bool
     scope: str | None = None
+    return_type: str | None = None  # the `-> T` annotation, as written
 
 
 @dataclass
@@ -33,9 +35,9 @@ class FieldSymbol:
     # annotation (`var a: T`), or inferred from a `:=` initializer (or a
     # const's value) of a shape whose type is certain -- see
     # `infer_expr_type`. Either a type name as written (resolved later, in
-    # this file's scope, by resolve.py) or a res:// script path (from
-    # `preload`). None = untyped/unknown.
-    type_name: str | None = None
+    # this file's scope, by resolve.py), a res:// script path (from
+    # `preload`), or a `CallType`. None = untyped/unknown.
+    type_name: str | CallType | None = None
 
 
 @dataclass
@@ -54,6 +56,9 @@ class FileSymbols:
     signals: list[SignalSymbol]
     fields: list[FieldSymbol] = field(default_factory=list)
     enums: list[EnumSymbol] = field(default_factory=list)
+    # Every inner class (dotted scope, e.g. "Outer.Inner") -> its own
+    # `extends` as written (see `extract_extends`), None if it has none.
+    class_extends: dict[str, str | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +68,7 @@ class FuncDefInfo:
     line: int
     is_static: bool
     node: Tree  # the func_def node (unwrapped from static_func_def, if any)
+    return_type: str | None = None  # the `-> T` annotation, as written
 
 
 def first_name_token(tree: Tree) -> str | None:
@@ -85,17 +91,16 @@ def extract_extends(tree: Tree) -> str | None:
     string-based extends (e.g. ``extends "res://base.gd"``).
 
     A dotted parent path can never match a project's (always single-name)
-    declared ``class_name``, so `build_inheritance_map` naturally treats it
-    as an untracked/unknown parent rather than something that needs
-    truncating here -- keeping only the first segment would misattribute
-    the parent to an unrelated top-level class of that name instead of
-    honestly leaving it unresolved (extending a *nested* class isn't
-    tracked in v1, same as inner classes' own extends).
+    declared ``class_name``, so `build_inheritance_map` leaves it out;
+    resolve.py resolves it as a type instead (`Base.State` -> the class
+    `State` nested in `Base`). Keeping only the first segment here would
+    misattribute the parent to an unrelated top-level class of that name.
 
-    Only scans the file's top-level statements (direct children of the
-    root), not the whole tree -- a nested `class Inner: extends ...` has
-    its own, separately-scoped parent that must not be mistaken for the
-    file's own top-level extends.
+    Only scans `tree`'s direct children, not the whole tree -- a nested
+    `class Inner extends ...` has its own, separately-scoped parent that
+    must not be mistaken for the file's own top-level extends. Given a
+    `class_def` node instead of a file's root, returns that class's own
+    `extends`.
     """
     for child in tree.children:
         if not (isinstance(child, Tree) and child.data in ("extends_stmt", "classname_extends_stmt")):
@@ -203,7 +208,11 @@ def iter_function_defs(tree: Tree) -> list[FuncDefInfo]:
                 if name is not None:
                     line = getattr(header.meta, "line", 0)
                     scope = ".".join(scope_stack) if scope_stack else None
-                    results.append(FuncDefInfo(scope, name, line, is_static, func_def_node))
+                    # `func f(args) -> T:` -- T is the token after func_args.
+                    return_type = next(
+                        (str(c) for c in header.children[2:] if isinstance(c, Token)), None
+                    )
+                    results.append(FuncDefInfo(scope, name, line, is_static, func_def_node, return_type))
             return
 
         if node.data in ("property_body_def", "lambda"):
@@ -330,39 +339,47 @@ def _preload_script_path(call: Tree, res_path: str | None) -> str | None:
     return path
 
 
-def infer_expr_type(node: object, res_path: str | None = None) -> str | None:
-    """The static type of an initializer expression, for the few shapes
-    whose type is certain without any wider analysis: `<expr> as T` -> "T",
+def infer_expr_type(node: object, res_path: str | None = None) -> str | CallType | None:
+    """The static type of an initializer expression, for the shapes whose
+    type is certain without any wider analysis: `<expr> as T` -> "T",
     `T.new(...)` -> "T", `preload("x.gd")` / `preload("x.gd").new(...)` ->
-    "res://x.gd". Anything else -> None. Callers only use this where GDScript
-    itself fixes the type at declaration (`:=`, or a const's value) -- never
-    for a plain `var x = ...`, which stays Variant and can be reassigned to
-    anything, so inferring from it could produce a wrong edge."""
-    while isinstance(node, Tree) and node.data in ("expr", "par_expr") and len(node.children) == 1:
-        node = node.children[0]
+    "res://x.gd", and a call -- `f()`, `obj.m()`, `T.make()`, also behind
+    `await` -> a `CallType`, typed by the called function's declared return
+    type once resolve.py finds it. Anything else -> None. Callers only use
+    this where GDScript itself fixes the type at declaration (`:=`, or a
+    const's value) -- never for a plain `var x = ...`, which stays Variant
+    and can be reassigned to anything, so inferring from it could produce a
+    wrong edge."""
+    while isinstance(node, Tree) and (
+        (node.data in ("expr", "par_expr") and len(node.children) == 1)
+        or (node.data == "await_expr" and node.children)
+    ):
+        node = node.children[-1]
     if not isinstance(node, Tree):
         return None
     if node.data == "actual_type_cast":
         type_token = node.children[-1] if node.children else None
         return str(type_token) if isinstance(type_token, Token) else None
     if node.data == "standalone_call":
-        return _preload_script_path(node, res_path)
+        preloaded = _preload_script_path(node, res_path)
+        return preloaded if preloaded is not None else call_type(node)
     if node.data == "getattr_call" and node.children:
         getattr_node = node.children[0]
         if not (isinstance(getattr_node, Tree) and getattr_node.data == "getattr"):
             return None
         base = getattr_node.children[0] if getattr_node.children else None
         names = [c for c in getattr_node.children[1:] if isinstance(c, Token) and c.type == "NAME"]
-        if len(names) != 1 or str(names[0]) != "new":
+        if len(names) == 1 and str(names[0]) == "new":
+            if isinstance(base, Token) and base.type == "NAME":
+                return str(base)
+            if isinstance(base, Tree) and base.data == "standalone_call":
+                return _preload_script_path(base, res_path)
             return None
-        if isinstance(base, Token) and base.type == "NAME":
-            return str(base)
-        if isinstance(base, Tree) and base.data == "standalone_call":
-            return _preload_script_path(base, res_path)
+        return call_type(node)
     return None
 
 
-def _declared_type(decl: Tree, res_path: str | None) -> str | None:
+def _declared_type(decl: Tree, res_path: str | None) -> str | CallType | None:
     """Static type of a var/const declaration node -- `<name> : <type> ...`
     (explicit annotation), or `<name> := <expr>` / `const <name> = <expr>`
     (inferred via `infer_expr_type`). A plain untyped `var <name> = <expr>`
@@ -386,7 +403,7 @@ _TYPED_DECL_NODES = (
 _INFERRED_DECL_NODES = ("class_var_inf", "func_var_inf", "const_inf", "const_assigned")
 
 
-def _collect_header_arg_types(header: Tree, types: dict[str, str | None]) -> None:
+def _collect_header_arg_types(header: Tree, types: dict[str, str | CallType | None]) -> None:
     """Walk a `func_header` node for its own declared parameters, e.g.
     `func_arg_typed` wrapped inside `func_arg_variadic`. Stops at a nested
     `lambda` node's boundary -- a lambda embedded in a default-argument-value
@@ -433,7 +450,9 @@ def _collect_header_arg_names(header: Tree, names: set[str]) -> None:
     walk(header)
 
 
-def _collect_local_var_types(body: list, types: dict[str, str | None], res_path: str | None = None) -> None:
+def _collect_local_var_types(
+    body: list, types: dict[str, str | CallType | None], res_path: str | None = None
+) -> None:
     """Shared walk for `extract_local_var_types` and the property-accessor
     equivalent below -- both need identical var/for-loop-variable
     collection over a list of body statements, differing only in how their
@@ -470,12 +489,13 @@ def _collect_local_var_types(body: list, types: dict[str, str | None], res_path:
         walk(child)
 
 
-def extract_local_var_types(func_def_node: Tree, res_path: str | None = None) -> dict[str, str | None]:
+def extract_local_var_types(func_def_node: Tree, res_path: str | None = None) -> dict[str, str | CallType | None]:
     """Map every local var/param/for-loop-variable name declared in a single
     function to its static type name, or ``None`` if it has none -- an
     explicit annotation, or a ``:=``/const initializer `infer_expr_type`
-    can type (``var x := Foo.new()`` -> ``Foo``); a plain untyped ``var x =
-    Foo.new()`` stays ``None``, since it can be reassigned to anything.
+    can type (``var x := Foo.new()`` -> ``Foo``, ``var x := make()`` -> the
+    call's `CallType`); a plain untyped ``var x = Foo.new()`` stays
+    ``None``, since it can be reassigned to anything.
     `res_path` (the function's own file) resolves a relative
     ``preload("x.gd")``. Every local name is recorded, not
     just typed ones, so callers can tell "this name is a known local --
@@ -484,7 +504,7 @@ def extract_local_var_types(func_def_node: Tree, res_path: str | None = None) ->
     bodies are skipped: they're their own scope, and walking into them
     would let a lambda-local variable clobber a same-named variable in the
     enclosing function's map."""
-    types: dict[str, str | None] = {}
+    types: dict[str, str | CallType | None] = {}
 
     header = func_def_node.children[0] if func_def_node.children else None
     if isinstance(header, Tree):
@@ -496,13 +516,13 @@ def extract_local_var_types(func_def_node: Tree, res_path: str | None = None) ->
 
 def extract_property_accessor_local_var_types(
     pa: "PropertyAccessorInfo", res_path: str | None = None
-) -> dict[str, str | None]:
+) -> dict[str, str | CallType | None]:
     """Same as `extract_local_var_types`, but for a property accessor body
     (``set``/``get``) rather than a `func_def` -- without this, a setter's
     implicit value parameter (and any locals it declares) would be
     invisible to the "a local shadows a same-named autoload/class_name"
     rule, since `iter_function_defs` never sees accessor bodies at all."""
-    types: dict[str, str | None] = {}
+    types: dict[str, str | CallType | None] = {}
     if pa.param_name is not None:
         types[pa.param_name] = None
     _collect_local_var_types(pa.body, types, res_path)
@@ -578,7 +598,7 @@ def extract_property_accessor_lambda_shadowed_names(pa: "PropertyAccessorInfo") 
 
 def extract_functions(tree: Tree) -> list[FunctionSymbol]:
     return [
-        FunctionSymbol(name=fd.name, line=fd.line, is_static=fd.is_static, scope=fd.scope)
+        FunctionSymbol(name=fd.name, line=fd.line, is_static=fd.is_static, scope=fd.scope, return_type=fd.return_type)
         for fd in iter_function_defs(tree)
     ]
 
@@ -639,6 +659,19 @@ def extract_fields(tree: Tree, res_path: str | None = None) -> list[FieldSymbol]
     return fields
 
 
+def extract_class_extends(tree: Tree) -> dict[str, str | None]:
+    """Every inner class's dotted scope -> its own `extends` (None if it
+    has none) -- see `FileSymbols.class_extends`."""
+    classes: dict[str, str | None] = {}
+    for scope, subtree in iter_scoped_subtrees(tree):
+        if subtree.data != "class_def":
+            continue
+        name = first_name_token(subtree)
+        if name is not None:
+            classes[f"{scope}.{name}" if scope else name] = extract_extends(subtree)
+    return classes
+
+
 def extract_enums(tree: Tree) -> list[EnumSymbol]:
     enums: list[EnumSymbol] = []
     for scope, subtree in iter_scoped_subtrees(tree):
@@ -674,4 +707,5 @@ def extract_symbols(parse_result: ParseResult) -> FileSymbols:
         signals=extract_signals(tree),
         fields=extract_fields(tree, parse_result.res_path),
         enums=extract_enums(tree),
+        class_extends=extract_class_extends(tree),
     )

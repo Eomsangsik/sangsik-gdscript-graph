@@ -1,31 +1,24 @@
 from __future__ import annotations
 
+import functools
+import hashlib
 import os
 import sqlite3
+import stat
+import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from gdscript_graph.calls import extract_calls_and_connections
-from gdscript_graph.discovery import discover
-from gdscript_graph.parse_cache import ParseCache, load_cache, parse_all_cached, save_cache
+from gdscript_graph.discovery import ProjectFiles, discover
+from gdscript_graph.extract import ExtractCache, extract_all, load_cache, save_cache
+from gdscript_graph.locking import build_lock
 from gdscript_graph.resolve import (
     build_project_index,
     resolve_calls,
     resolve_scene_connections,
     resolve_signal_connections,
-)
-from gdscript_graph.symbols import (
-    FileSymbols,
-    extract_class_name,
-    extract_extends,
-    extract_lambda_shadowed_names,
-    extract_local_var_types,
-    extract_property_accessor_lambda_shadowed_names,
-    extract_property_accessor_local_var_types,
-    extract_symbols,
-    iter_function_defs,
-    iter_property_accessor_defs,
 )
 
 SCHEMA = """
@@ -139,20 +132,35 @@ CREATE TABLE meta (
     value TEXT NOT NULL
 );
 
--- Carries each file's already-parsed tree forward from one build to the
--- next, keyed by a content hash -- an unchanged hash guarantees a
--- bit-for-bit identical tree (parsing is a pure function of a file's own
--- bytes), so skipping re-parsing on a cache hit is always safe. Not part
--- of REQUIRED_TABLES: it's a pure performance optimization, never
--- required for a db to be valid -- if missing (e.g. the previous build
--- predates this feature, or the db is fresh), every file simply parses
--- fresh, same as before this cache existed.
-CREATE TABLE parse_cache (
+-- Every input file the build read, as it was on disk then: a server start
+-- compares this against the project to skip a rebuild when nothing changed.
+CREATE TABLE inputs (
+    res_path TEXT PRIMARY KEY,
+    mtime_ns INTEGER NOT NULL,
+    size INTEGER NOT NULL
+);
+
+-- Carries each file's extraction (symbols, raw calls, local types -- see
+-- extract.FileExtract) forward from one build to the next, keyed by a
+-- content hash; meta's `extract_cache_version` says which extractor wrote
+-- it. Not part of REQUIRED_TABLES: it's a pure performance optimization,
+-- never required for a db to be valid -- if missing or from another
+-- version, every file is simply extracted fresh.
+CREATE TABLE extract_cache (
     res_path TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
-    tree_blob BLOB NOT NULL
+    blob BLOB NOT NULL
 );
 """
+
+
+# `unresolved_calls.reason`s of a call that may really be into project code
+# the graph failed to follow; every other reason is a call into the engine
+# or GDScript itself (see resolve.UnresolvedCall).
+POSSIBLY_MISSED_REASONS = ("unknown_receiver", "method_not_found_in_target")
+
+# A build's temp db is `<db name><TEMP_INFIX><pid>-<random>`, next to the db.
+TEMP_INFIX = ".tmp-"
 
 
 @dataclass
@@ -164,7 +172,8 @@ class BuildStats:
     field_count: int
     enum_count: int
     resolved_call_count: int
-    unresolved_call_count: int
+    unresolved_call_count: int  # possibly-missed project calls (see POSSIBLY_MISSED_REASONS)
+    engine_call_count: int  # calls into the engine / GDScript built-ins
     resolved_connection_count: int
     unresolved_connection_count: int
     resolved_scene_connection_count: int
@@ -175,31 +184,167 @@ class BuildStats:
     # ambiguity existed, which is usually a real authoring mistake worth
     # surfacing rather than silently picking a winner.
     duplicate_class_names: dict[str, list[str]]
-    # How many of `file_count` files reused a cached tree from the previous
-    # build (skipping the ~20-30x more expensive Lark parse) vs. how many
-    # were freshly parsed (new/changed file, or no usable previous build).
-    parse_cache_hits: int
-    parse_cache_misses: int
+    # How many of `file_count` files reused the previous build's extraction
+    # (skipping the parse and tree walks) vs. how many were extracted fresh
+    # (new/changed file, or no usable previous build).
+    cache_hits: int
+    cache_misses: int
 
 
-def build_database(project_root: Path, db_path: Path) -> BuildStats:
+def build_database(
+    project_root: Path,
+    db_path: Path,
+    if_changed: bool = False,
+    on_build_start: Callable[[], None] | None = None,
+) -> BuildStats | None:
+    """Build (or rebuild) the graph of `project_root` into `db_path`. With
+    `if_changed`, skip it -- returning None -- when `db_path` is already a
+    build of the project exactly as it is now (see `_is_current`).
+    `on_build_start` is called once it's decided a build will happen."""
     if db_path.exists() and db_path.is_dir():
         raise IsADirectoryError(f"-o path is a directory, not a file: {db_path}")
 
-    # Load the previous build's cached trees (if any) *before* touching
-    # db_path -- this is the only chance to read them before the atomic
-    # swap below replaces the file they live in.
-    old_parse_cache = load_cache(db_path)
+    project = discover(project_root)
+    manifest = input_manifest(project)
+    # Checked before taking the lock too: a read-only look that shouldn't
+    # make anyone wait, or look like a rebuild in progress.
+    if if_changed and _is_current(db_path, manifest):
+        lock = build_lock(db_path)
+        if lock.acquire(blocking=False):
+            try:
+                _remove_stale_temp_files(db_path)
+            finally:
+                lock.release()
+        return None
+
+    # One build of a db at a time, across every process (MCP servers of
+    # several sessions, a CLI build): a later build waits and then reuses the
+    # earlier one's cache instead of redoing all of its work concurrently.
+    with build_lock(db_path):
+        _remove_stale_temp_files(db_path)
+        # ...and checked again, in case the build waited on just did it.
+        if if_changed and _is_current(db_path, manifest):
+            return None
+        if on_build_start is not None:
+            on_build_start()
+        return _build_locked(project, manifest, db_path)
+
+
+def input_manifest(project: ProjectFiles) -> dict[str, tuple[int, int]]:
+    """res:// path -> (mtime_ns, size) of every file a build reads."""
+    manifest: dict[str, tuple[int, int]] = {}
+    for path in (*project.gd_files, *project.scene_files, project.root / "project.godot"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        manifest[project.to_res_path(path)] = (st.st_mtime_ns, st.st_size)
+    return manifest
+
+
+@functools.cache
+def builder_version() -> str:
+    """Identifies the code (and bundled engine API data) that builds a db:
+    a db built by any other version is rebuilt even if no project file
+    changed since."""
+    package = Path(__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted([*package.glob("*.py"), *package.glob("*.json")]):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+# A file modified this close to a build's start could have changed again
+# within the same modification-time tick (1-2 s on some filesystems) after
+# that build read it -- so its unchanged mtime proves nothing.
+_MTIME_TRUST_MARGIN_NS = 2_000_000_000
+
+
+def _unchanged_since_last_build(db_path: Path, manifest: dict[str, tuple[int, int]]) -> set[str]:
+    """res:// paths whose modification time and size match what the
+    previous build of `db_path` recorded, and which were last modified
+    well before it started -- so its cached extraction can be reused
+    without reading the file at all (reading and hashing every file was
+    most of an unchanged rebuild's time)."""
+    try:
+        conn = connect(db_path)
+        try:
+            built_at = get_meta(conn, "built_at")
+            stored = {
+                row["res_path"]: (row["mtime_ns"], row["size"])
+                for row in conn.execute("SELECT res_path, mtime_ns, size FROM inputs")
+            }
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return set()
+    if built_at is None:
+        return set()
+    cutoff = int(float(built_at) * 1e9) - _MTIME_TRUST_MARGIN_NS
+    return {path for path, stat in manifest.items() if stored.get(path) == stat and stat[0] < cutoff}
+
+
+def _is_current(db_path: Path, manifest: dict[str, tuple[int, int]]) -> bool:
+    """Whether `db_path` is a complete build, by this code, of exactly the
+    input files in `manifest` -- same paths, modification times and sizes.
+    Lets a server start skip the rebuild it would otherwise run on every
+    launch to catch edits made while no server was running."""
+    if not db_path.exists():
+        return False
+    try:
+        conn = connect(db_path)
+        try:
+            validate_schema(conn)
+            if get_meta(conn, "builder_version") != builder_version():
+                return False
+            stored = {
+                row["res_path"]: (row["mtime_ns"], row["size"])
+                for row in conn.execute("SELECT res_path, mtime_ns, size FROM inputs")
+            }
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return False
+    return stored == manifest
+
+
+def _remove_stale_temp_files(db_path: Path) -> None:
+    """Delete temp dbs (and their journals) left by builds that never
+    finished -- a server killed mid-build, e.g. when its session ended.
+    Only called under the build lock, so no live build owns one."""
+    for path in db_path.parent.glob(f"{db_path.name}{TEMP_INFIX}*"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _build_locked(project: ProjectFiles, manifest: dict[str, tuple[int, int]], db_path: Path) -> BuildStats:
+    # Load the previous build's cache (if any) *before* touching db_path --
+    # this is the only chance to read it before the atomic swap below
+    # replaces the file it lives in.
+    old_cache = load_cache(db_path)
+    unchanged = _unchanged_since_last_build(db_path, manifest) if old_cache else set()
 
     # Build into a temp file and atomically swap it into place at the end,
     # so a failure partway through a rebuild never destroys a previously
-    # working database.
-    tmp_path = db_path.with_name(f"{db_path.name}.tmp-{os.getpid()}")
-    tmp_path.unlink(missing_ok=True)
+    # working database. The name is unique per build, not just per process:
+    # two builds sharing one temp file used to unlink each other's work, and
+    # the first to finish swapped the other's still-empty db into place.
+    fd, tmp_name = tempfile.mkstemp(dir=db_path.parent, prefix=f"{db_path.name}{TEMP_INFIX}{os.getpid()}-")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    # mkstemp creates the file owner-only (0600); keep the db's own mode.
+    try:
+        mode = stat.S_IMODE(db_path.stat().st_mode)
+    except OSError:
+        mode = 0o644
+    os.chmod(tmp_path, mode)
 
     conn = sqlite3.connect(tmp_path)
     try:
-        stats = _populate(conn, project_root, old_parse_cache)
+        stats = _populate(conn, project, manifest, old_cache, unchanged)
         conn.commit()
     except Exception:
         conn.close()
@@ -222,44 +367,32 @@ def build_database(project_root: Path, db_path: Path) -> BuildStats:
     return stats
 
 
-def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: ParseCache | None = None) -> BuildStats:
+def _populate(
+    conn: sqlite3.Connection,
+    project: ProjectFiles,
+    manifest: dict[str, tuple[int, int]],
+    old_cache: ExtractCache | None = None,
+    unchanged: set[str] | frozenset[str] = frozenset(),
+) -> BuildStats:
     conn.executescript(SCHEMA)
     conn.executemany(
         "INSERT INTO meta (key, value) VALUES (?, ?)",
-        [("project_root", str(project_root)), ("built_at", str(time.time()))],
+        [
+            ("project_root", str(project.root)),
+            ("built_at", str(time.time())),
+            ("builder_version", builder_version()),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO inputs (res_path, mtime_ns, size) VALUES (?, ?, ?)",
+        [(path, mtime_ns, size) for path, (mtime_ns, size) in manifest.items()],
     )
 
-    project = discover(project_root)
-    parse_results, new_parse_cache, cache_hits = parse_all_cached(
-        project.gd_files, project.to_res_path, old_parse_cache or {}
-    )
-    save_cache(conn, new_parse_cache)
+    extracts, new_cache, cache_hits = extract_all(project.gd_files, project.to_res_path, old_cache or {}, unchanged)
+    save_cache(conn, new_cache)
 
-    # A pathologically deep expression/call nesting (e.g. 1000+ levels of
-    # nested calls) parses fine at the Lark level but can blow Python's
-    # recursion limit in our own tree walks -- isolate that to this one
-    # file (same as a genuine parse error) rather than letting it abort
-    # the whole build and discard every other file's data.
-    all_symbols: list[FileSymbols] = []
-    for pr in parse_results:
-        try:
-            all_symbols.append(extract_symbols(pr))
-        except RecursionError:
-            pr.error = pr.error or "too deeply nested to index (exceeded a safe recursion depth)"
-            # class_name/extends only scan the tree's direct top-level
-            # children (no recursion), so they're still safe to compute
-            # here even though the fuller extraction overflowed -- losing
-            # them too would silently break inheritance-chain resolution
-            # for every OTHER file that extends this one.
-            all_symbols.append(FileSymbols(
-                res_path=pr.res_path,
-                class_name=extract_class_name(pr.tree),
-                extends=extract_extends(pr.tree),
-                functions=[], signals=[],
-            ))
-
+    all_symbols = [fx.symbols for fx in extracts]
     index = build_project_index(all_symbols, project.autoloads)
-    inheritance_map = index.inheritance_map
 
     class_name_declarers: dict[str, list[str]] = {}
     for fs in all_symbols:
@@ -267,140 +400,65 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
             class_name_declarers.setdefault(fs.class_name, []).append(fs.res_path)
     duplicate_class_names = {name: paths for name, paths in class_name_declarers.items() if len(paths) > 1}
 
-    # res_path -> its own top-level signal names, used below to let a bare
-    # `<signal>.connect(...)` reach a signal inherited from an ancestor file
-    # (inner-class inheritance isn't tracked, same limitation as elsewhere).
-    top_level_signals_by_path: dict[str, set[str]] = {
-        fs.res_path: {sig.name for sig in fs.signals if sig.scope is None} for fs in all_symbols
-    }
-
-    # First occurrence wins for duplicate (res_path, scope, name) pairs --
-    # e.g. two overloaded-by-arity-only declarations. Known v1 limitation.
+    # Symbol ids are assigned here rather than read back per insert, so
+    # each table goes in with one executemany. First occurrence wins for
+    # duplicate (res_path, scope, name) pairs -- e.g. two overloaded-by-
+    # arity-only declarations. Known v1 limitation.
     symbol_lookup: dict[tuple[str, str | None, str], int] = {}
-    parse_error_count = 0
-    function_count = 0
-    signal_count = 0
-    field_count = 0
-    enum_count = 0
+    file_rows: list[tuple] = []
+    symbol_rows: list[tuple] = []
+    parse_error_count = function_count = signal_count = field_count = enum_count = 0
 
-    for pr, fs in zip(parse_results, all_symbols):
-        if pr.error is not None:
+    def add_symbol(res_path: str, name: str, kind: str, scope: str | None, line: int, is_static: bool) -> int:
+        symbol_id = len(symbol_rows) + 1
+        symbol_rows.append((symbol_id, res_path, name, kind, scope, line, int(is_static)))
+        return symbol_id
+
+    for fx in extracts:
+        fs = fx.symbols
+        if fx.error is not None:
             parse_error_count += 1
-        conn.execute(
-            "INSERT INTO files (res_path, class_name, extends, parse_error) VALUES (?, ?, ?, ?)",
-            (fs.res_path, fs.class_name, fs.extends, pr.error),
-        )
+        file_rows.append((fs.res_path, fs.class_name, fs.extends, fx.error))
         for func in fs.functions:
-            cur = conn.execute(
-                "INSERT INTO symbols (res_path, name, kind, scope, line, is_static) "
-                "VALUES (?, ?, 'function', ?, ?, ?)",
-                (fs.res_path, func.name, func.scope, func.line, int(func.is_static)),
-            )
-            symbol_lookup.setdefault((fs.res_path, func.scope, func.name), cur.lastrowid)
+            symbol_id = add_symbol(fs.res_path, func.name, "function", func.scope, func.line, func.is_static)
+            symbol_lookup.setdefault((fs.res_path, func.scope, func.name), symbol_id)
             function_count += 1
         for sig in fs.signals:
-            cur = conn.execute(
-                "INSERT INTO symbols (res_path, name, kind, scope, line, is_static) "
-                "VALUES (?, ?, 'signal', ?, ?, 0)",
-                (fs.res_path, sig.name, sig.scope, sig.line),
-            )
-            symbol_lookup.setdefault((fs.res_path, sig.scope, sig.name), cur.lastrowid)
+            symbol_id = add_symbol(fs.res_path, sig.name, "signal", sig.scope, sig.line, False)
+            symbol_lookup.setdefault((fs.res_path, sig.scope, sig.name), symbol_id)
             signal_count += 1
         for fld in fs.fields:
-            conn.execute(
-                "INSERT INTO symbols (res_path, name, kind, scope, line, is_static) "
-                "VALUES (?, ?, ?, ?, ?, 0)",
-                (fs.res_path, fld.name, fld.kind, fld.scope, fld.line),
-            )
+            add_symbol(fs.res_path, fld.name, fld.kind, fld.scope, fld.line, False)
             field_count += 1
         for enm in fs.enums:
-            conn.execute(
-                "INSERT INTO symbols (res_path, name, kind, scope, line, is_static) "
-                "VALUES (?, ?, 'enum', ?, ?, 0)",
-                (fs.res_path, enm.name, enm.scope, enm.line),
-            )
+            add_symbol(fs.res_path, enm.name, "enum", enm.scope, enm.line, False)
             enum_count += 1
+    conn.executemany("INSERT INTO files (res_path, class_name, extends, parse_error) VALUES (?, ?, ?, ?)", file_rows)
+    conn.executemany(
+        "INSERT INTO symbols (id, res_path, name, kind, scope, line, is_static) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        symbol_rows,
+    )
 
-    resolved_call_count = 0
-    unresolved_call_count = 0
-    resolved_connection_count = 0
-    unresolved_connection_count = 0
-
-    for pr, fs in zip(parse_results, all_symbols):
-        if pr.tree is None:
-            continue
-
-        try:
-            signal_names_by_scope: dict[str | None, dict[str, str]] = {}
-            for sig in fs.signals:
-                signal_names_by_scope.setdefault(sig.scope, {})[sig.name] = fs.res_path
-
-            # Walk the top-level extends chain so a bare `<signal>.connect(...)`
-            # in a subclass can reach a signal declared in an ancestor file --
-            # own-file declarations take precedence via setdefault.
-            top_level_signal_names = signal_names_by_scope.setdefault(None, {})
-            visited_ancestors: set[str] = {fs.res_path}
-            ancestor = inheritance_map.get(fs.res_path)
-            while ancestor is not None and ancestor not in visited_ancestors:
-                visited_ancestors.add(ancestor)
-                for name in top_level_signals_by_path.get(ancestor, ()):
-                    top_level_signal_names.setdefault(name, ancestor)
-                ancestor = inheritance_map.get(ancestor)
-
-            raw_calls, raw_connections = extract_calls_and_connections(pr.tree, signal_names_by_scope)
-
-            local_var_types: dict[tuple[str | None, str], dict[str, str | None]] = {}
-            lambda_shadowed_names: dict[tuple[str | None, str], set[str]] = {}
-            for fd in iter_function_defs(pr.tree):
-                local_var_types[(fd.scope, fd.name)] = extract_local_var_types(fd.node, fs.res_path)
-                lambda_shadowed_names[(fd.scope, fd.name)] = extract_lambda_shadowed_names(fd.node)
-            for pa in iter_property_accessor_defs(pr.tree):
-                local_var_types[(pa.scope, pa.name)] = extract_property_accessor_local_var_types(pa, fs.res_path)
-                lambda_shadowed_names[(pa.scope, pa.name)] = extract_property_accessor_lambda_shadowed_names(pa)
-
-            resolved, unresolved = resolve_calls(fs, raw_calls, index, local_var_types, lambda_shadowed_names)
-            resolved_conns, unresolved_conns = resolve_signal_connections(
-                fs, raw_connections, index, local_var_types, lambda_shadowed_names,
-            )
-        except RecursionError:
-            # Same pathological-nesting hazard as the extract_symbols guard
-            # above, just reachable independently here (a tree can be deep
-            # enough to survive that walk but not this one, or vice versa)
-            # -- skip this one file's calls/connections rather than
-            # aborting the whole build. Unlike the extract_symbols guard,
-            # this file's `files` row was already inserted (with whatever
-            # parse_error extract_symbols left it with) before this loop
-            # even started, so a plain `pr.error = ...` here wouldn't reach
-            # it -- without an explicit UPDATE, the file would look fully
-            # clean (parse_error NULL, correct symbol counts) while its
-            # entire call/signal-connection graph silently vanished with no
-            # trace anywhere.
-            if pr.error is None:
-                pr.error = "too deeply nested to extract calls/connections (exceeded a safe recursion depth)"
-                parse_error_count += 1
-                conn.execute(
-                    "UPDATE files SET parse_error = ? WHERE res_path = ?", (pr.error, fs.res_path)
-                )
-            continue
+    call_rows: list[tuple] = []
+    unresolved_call_rows: list[tuple] = []
+    connection_rows: list[tuple] = []
+    unresolved_connection_rows: list[tuple] = []
+    for fx in extracts:
+        fs = fx.symbols
+        resolved, unresolved = resolve_calls(fs, fx.calls, index, fx.local_var_types, fx.lambda_shadowed_names)
+        resolved_conns, unresolved_conns = resolve_signal_connections(
+            fs, fx.connections, index, fx.local_var_types, fx.lambda_shadowed_names,
+        )
 
         for rc in resolved:
             source_id = symbol_lookup.get((rc.source_res_path, rc.source_scope, rc.source_function))
             target_id = symbol_lookup.get((rc.target_res_path, rc.target_scope, rc.target_function))
-            if source_id is None or target_id is None:
-                continue
-            conn.execute(
-                "INSERT INTO calls (source_symbol_id, target_symbol_id, line) VALUES (?, ?, ?)",
-                (source_id, target_id, rc.line),
-            )
-            resolved_call_count += 1
-        for uc in unresolved:
-            conn.execute(
-                "INSERT INTO unresolved_calls "
-                "(source_res_path, source_scope, source_function, receiver, called_name, line, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (uc.source_res_path, uc.source_scope, uc.source_function, uc.receiver, uc.called_name, uc.line, uc.reason),
-            )
-            unresolved_call_count += 1
+            if source_id is not None and target_id is not None:
+                call_rows.append((source_id, target_id, rc.line))
+        unresolved_call_rows += [
+            (uc.source_res_path, uc.source_scope, uc.source_function, uc.receiver, uc.called_name, uc.line, uc.reason)
+            for uc in unresolved
+        ]
 
         for rc in resolved_conns:
             # A bare/self/inherited `<signal>.connect(...)` reference is
@@ -414,25 +472,38 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
                 if rc.signal_res_path is not None else None
             )
             handler_id = symbol_lookup.get((rc.handler_res_path, rc.handler_scope, rc.handler_function))
-            if source_id is None or handler_id is None:
-                continue
-            conn.execute(
-                "INSERT INTO signal_connections "
-                "(source_symbol_id, signal_name, signal_symbol_id, handler_symbol_id, line) VALUES (?, ?, ?, ?, ?)",
-                (source_id, rc.signal_name, signal_id, handler_id, rc.line),
+            if source_id is not None and handler_id is not None:
+                connection_rows.append((source_id, rc.signal_name, signal_id, handler_id, rc.line))
+        unresolved_connection_rows += [
+            (
+                uc.source_res_path, uc.source_function, uc.signal_receiver, uc.signal_name,
+                uc.handler_receiver, uc.handler_name, uc.line, uc.reason,
             )
-            resolved_connection_count += 1
-        for uc in unresolved_conns:
-            conn.execute(
-                "INSERT INTO unresolved_connections "
-                "(source_res_path, source_function, signal_receiver, signal_name, handler_receiver, handler_name, line, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    uc.source_res_path, uc.source_function, uc.signal_receiver, uc.signal_name,
-                    uc.handler_receiver, uc.handler_name, uc.line, uc.reason,
-                ),
-            )
-            unresolved_connection_count += 1
+            for uc in unresolved_conns
+        ]
+
+    conn.executemany("INSERT INTO calls (source_symbol_id, target_symbol_id, line) VALUES (?, ?, ?)", call_rows)
+    conn.executemany(
+        "INSERT INTO unresolved_calls "
+        "(source_res_path, source_scope, source_function, receiver, called_name, line, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        unresolved_call_rows,
+    )
+    conn.executemany(
+        "INSERT INTO signal_connections "
+        "(source_symbol_id, signal_name, signal_symbol_id, handler_symbol_id, line) VALUES (?, ?, ?, ?, ?)",
+        connection_rows,
+    )
+    conn.executemany(
+        "INSERT INTO unresolved_connections "
+        "(source_res_path, source_function, signal_receiver, signal_name, handler_receiver, handler_name, line, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        unresolved_connection_rows,
+    )
+    resolved_call_count = len(call_rows)
+    unresolved_call_count = sum(1 for row in unresolved_call_rows if row[-1] in POSSIBLY_MISSED_REASONS)
+    engine_call_count = len(unresolved_call_rows) - unresolved_call_count
+    resolved_connection_count, unresolved_connection_count = len(connection_rows), len(unresolved_connection_rows)
 
     resolved_scene_connection_count = 0
     unresolved_scene_connection_count = 0
@@ -467,7 +538,7 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
             unresolved_scene_connection_count += 1
 
     return BuildStats(
-        file_count=len(parse_results),
+        file_count=len(extracts),
         parse_error_count=parse_error_count,
         function_count=function_count,
         signal_count=signal_count,
@@ -475,13 +546,14 @@ def _populate(conn: sqlite3.Connection, project_root: Path, old_parse_cache: Par
         enum_count=enum_count,
         resolved_call_count=resolved_call_count,
         unresolved_call_count=unresolved_call_count,
+        engine_call_count=engine_call_count,
         resolved_connection_count=resolved_connection_count,
         unresolved_connection_count=unresolved_connection_count,
         resolved_scene_connection_count=resolved_scene_connection_count,
         unresolved_scene_connection_count=unresolved_scene_connection_count,
         duplicate_class_names=duplicate_class_names,
-        parse_cache_hits=cache_hits,
-        parse_cache_misses=len(parse_results) - cache_hits,
+        cache_hits=cache_hits,
+        cache_misses=len(extracts) - cache_hits,
     )
 
 
@@ -491,13 +563,45 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def search_symbols(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[sqlite3.Row]:
-    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    like = f"%{escaped}%"
-    return conn.execute(
-        "SELECT res_path, name, kind, scope, line FROM symbols WHERE name LIKE ? ESCAPE '\\' ORDER BY name LIMIT ?",
-        (like, limit),
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_symbols(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 20,
+    kind: str | None = None,
+    path_prefix: str | None = None,
+) -> tuple[list[sqlite3.Row], int]:
+    """Symbols whose name contains `query` (case-insensitively), optionally
+    only of one `kind` and/or under a res:// `path_prefix` -- best matches
+    first: an exact name, then the exact name in another case, then names
+    starting with `query`, then the rest, shorter names first within each.
+    (Ordered by name alone, an exact `get` sank below `get_a`... `get_z`.)
+    Returns (up to `limit` rows, how many match in all)."""
+    escaped = _like_escape(query)
+    where = "name LIKE ? ESCAPE '\\'"
+    params: list = [f"%{escaped}%"]
+    if kind is not None:
+        where += " AND kind = ?"
+        params.append(kind)
+    if path_prefix is not None:
+        where += " AND res_path LIKE ? ESCAPE '\\'"
+        params.append(f"{_like_escape(path_prefix)}%")
+    total = conn.execute(f"SELECT COUNT(*) FROM symbols WHERE {where}", params).fetchone()[0]
+    rows = conn.execute(
+        f"""SELECT res_path, name, kind, scope, line FROM symbols WHERE {where}
+            ORDER BY CASE
+                WHEN name = ? THEN 0
+                WHEN lower(name) = lower(?) THEN 1
+                WHEN name LIKE ? ESCAPE '\\' THEN 2
+                ELSE 3
+            END, length(name), name, res_path, line
+            LIMIT ?""",
+        [*params, query, query, f"{escaped}%", limit],
     ).fetchall()
+    return rows, total
 
 
 def list_files(conn: sqlite3.Connection, prefix: str | None = None) -> list[dict]:
@@ -507,9 +611,8 @@ def list_files(conn: sqlite3.Connection, prefix: str | None = None) -> list[dict
         # Escape LIKE metacharacters same as search_symbols -- a prefix
         # containing a literal "%"/"_" (unusual in a res:// path, but not
         # impossible) must be matched literally, not as a wildcard.
-        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         query += " WHERE res_path LIKE ? ESCAPE '\\'"
-        params.append(f"{escaped}%")
+        params.append(f"{_like_escape(prefix)}%")
     query += " ORDER BY res_path"
     file_rows = conn.execute(query, params).fetchall()
 
@@ -561,8 +664,21 @@ def _symbol_filter(alias: str, name: str, res_path: str | None, scope: str | Non
     return condition, params
 
 
+def _endpoint(role: str, row: sqlite3.Row, include: bool) -> dict:
+    """`{<role>_file, <role>_scope}` from a row's `tgt_*`/`src_*` columns
+    (whichever `role` names), or nothing unless `include`."""
+    if not include:
+        return {}
+    prefix = "tgt" if role == "target" else "src"
+    return {f"{role}_file": row[f"{prefix}_path"], f"{role}_scope": row[f"{prefix}_scope"]}
+
+
 def get_callers(
-    conn: sqlite3.Connection, function_name: str, res_path: str | None = None, scope: str | None = None
+    conn: sqlite3.Connection,
+    function_name: str,
+    res_path: str | None = None,
+    scope: str | None = None,
+    with_target: bool = False,
 ) -> list[dict]:
     """Everything that makes the given function run: direct calls, and its
     registrations as a signal handler -- a `<signal>.connect(<function>)`
@@ -573,15 +689,17 @@ def get_callers(
     latter two it would look like dead code -- and changing its signature
     breaks exactly those connection sites. Only those two kinds carry
     `via`; a row without it is a direct call (the common case, kept as
-    small as before for a function with hundreds of call sites)."""
+    small as before for a function with hundreds of call sites).
+    `with_target` adds which declaration each row reaches
+    (`target_file`/`target_scope`) -- for a name several declare."""
     condition, params = _symbol_filter("tgt", function_name, res_path, scope)
     rows: list[dict] = [
         {
             "caller_file": r["res_path"], "caller_scope": r["scope"], "caller_function": r["name"],
-            "call_line": r["line"],
+            "call_line": r["line"], **_endpoint("target", r, with_target),
         }
         for r in conn.execute(f"""
-            SELECT src.res_path, src.scope, src.name, c.line
+            SELECT src.res_path, src.scope, src.name, c.line, tgt.res_path AS tgt_path, tgt.scope AS tgt_scope
             FROM calls c
             JOIN symbols src ON src.id = c.source_symbol_id
             JOIN symbols tgt ON tgt.id = c.target_symbol_id
@@ -592,9 +710,11 @@ def get_callers(
         {
             "caller_file": r["res_path"], "caller_scope": r["scope"], "caller_function": r["name"],
             "call_line": r["line"], "via": "connect", "signal": r["signal_name"],
+            **_endpoint("target", r, with_target),
         }
         for r in conn.execute(f"""
-            SELECT src.res_path, src.scope, src.name, sc.line, sc.signal_name
+            SELECT src.res_path, src.scope, src.name, sc.line, sc.signal_name,
+                   tgt.res_path AS tgt_path, tgt.scope AS tgt_scope
             FROM signal_connections sc
             JOIN symbols src ON src.id = sc.source_symbol_id
             JOIN symbols tgt ON tgt.id = sc.handler_symbol_id
@@ -605,10 +725,11 @@ def get_callers(
         {
             "caller_file": r["scene_res_path"], "caller_scope": None, "caller_function": None,
             "call_line": r["line"], "via": "scene", "signal": r["signal_name"],
-            "from_node": r["from_node"], "to_node": r["to_node"],
+            "from_node": r["from_node"], "to_node": r["to_node"], **_endpoint("target", r, with_target),
         }
         for r in conn.execute(f"""
-            SELECT sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, sc.to_node
+            SELECT sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, sc.to_node,
+                   tgt.res_path AS tgt_path, tgt.scope AS tgt_scope
             FROM scene_connections sc
             JOIN symbols tgt ON tgt.id = sc.handler_symbol_id
             WHERE {condition}
@@ -619,19 +740,25 @@ def get_callers(
 
 
 def get_callees(
-    conn: sqlite3.Connection, function_name: str, res_path: str | None = None, scope: str | None = None
+    conn: sqlite3.Connection,
+    function_name: str,
+    res_path: str | None = None,
+    scope: str | None = None,
+    with_source: bool = False,
 ) -> list[dict]:
     """Functions the given function calls, and the signal handlers it
     registers with `<signal>.connect(<handler>)` (marked `via: "connect"`)
-    -- code that runs because of it either way."""
+    -- code that runs because of it either way. `with_source` adds which
+    declaration each row comes from (`source_file`/`source_scope`) -- for a
+    name several declare."""
     condition, params = _symbol_filter("src", function_name, res_path, scope)
     rows: list[dict] = [
         {
             "callee_file": r["res_path"], "callee_scope": r["scope"], "callee_function": r["name"],
-            "call_line": r["line"],
+            "call_line": r["line"], **_endpoint("source", r, with_source),
         }
         for r in conn.execute(f"""
-            SELECT tgt.res_path, tgt.scope, tgt.name, c.line
+            SELECT tgt.res_path, tgt.scope, tgt.name, c.line, src.res_path AS src_path, src.scope AS src_scope
             FROM calls c
             JOIN symbols src ON src.id = c.source_symbol_id
             JOIN symbols tgt ON tgt.id = c.target_symbol_id
@@ -642,9 +769,11 @@ def get_callees(
         {
             "callee_file": r["res_path"], "callee_scope": r["scope"], "callee_function": r["name"],
             "call_line": r["line"], "via": "connect", "signal": r["signal_name"],
+            **_endpoint("source", r, with_source),
         }
         for r in conn.execute(f"""
-            SELECT h.res_path, h.scope, h.name, sc.line, sc.signal_name
+            SELECT h.res_path, h.scope, h.name, sc.line, sc.signal_name,
+                   src.res_path AS src_path, src.scope AS src_scope
             FROM signal_connections sc
             JOIN symbols src ON src.id = sc.source_symbol_id
             JOIN symbols h ON h.id = sc.handler_symbol_id
@@ -798,10 +927,9 @@ def _bfs_symbols(
                 best[node] = (hop, kind)
 
     results = []
+    symbol_rows = _rows_by_id(conn, "SELECT id, res_path, name, scope, line FROM symbols WHERE id IN ({})", best)
     for sid, (hop, kind) in best.items():
-        row = conn.execute(
-            "SELECT res_path, name, scope, line FROM symbols WHERE id = ?", (sid,)
-        ).fetchone()
+        row = symbol_rows.get(sid)
         if row is not None:
             entry = {
                 "res_path": row["res_path"],
@@ -816,17 +944,17 @@ def _bfs_symbols(
 
     if reverse:
         scene_best: dict[int, tuple[int, sqlite3.Row]] = {}
-        for sid, hop in reached_at.items():
-            if hop + 1 > max_depth:
-                continue
-            for sc in conn.execute(
-                "SELECT sc.id, sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, sc.to_node, "
-                "h.name AS method FROM scene_connections sc JOIN symbols h ON h.id = sc.handler_symbol_id "
-                "WHERE sc.handler_symbol_id = ?",
-                (sid,),
-            ):
-                if sc["id"] not in scene_best or hop + 1 < scene_best[sc["id"]][0]:
-                    scene_best[sc["id"]] = (hop + 1, sc)
+        handler_ids = [sid for sid, hop in reached_at.items() if hop + 1 <= max_depth]
+        for sc in _query_in_chunks(
+            conn,
+            "SELECT sc.id, sc.handler_symbol_id, sc.scene_res_path, sc.line, sc.signal_name, sc.from_node, "
+            "sc.to_node, h.name AS method FROM scene_connections sc JOIN symbols h ON h.id = sc.handler_symbol_id "
+            "WHERE sc.handler_symbol_id IN ({})",
+            handler_ids,
+        ):
+            hop = reached_at[sc["handler_symbol_id"]]
+            if sc["id"] not in scene_best or hop + 1 < scene_best[sc["id"]][0]:
+                scene_best[sc["id"]] = (hop + 1, sc)
         for hop, sc in scene_best.values():
             results.append({
                 "res_path": sc["scene_res_path"],
@@ -845,8 +973,40 @@ def _bfs_symbols(
     return results
 
 
+# Ids per `IN (...)` query -- well under SQLite's bound-parameter limit.
+_IN_CHUNK = 500
+
+
+def _query_in_chunks(conn: sqlite3.Connection, sql: str, ids) -> list[sqlite3.Row]:
+    """`sql` (with one `IN ({})` slot) run over `ids` in chunks: one query
+    per few hundred ids instead of one per id."""
+    ids = list(ids)
+    rows: list[sqlite3.Row] = []
+    for start in range(0, len(ids), _IN_CHUNK):
+        chunk = ids[start:start + _IN_CHUNK]
+        rows += conn.execute(sql.format(",".join("?" * len(chunk))), chunk).fetchall()
+    return rows
+
+
+def _rows_by_id(conn: sqlite3.Connection, sql: str, ids) -> dict[int, sqlite3.Row]:
+    return {row["id"]: row for row in _query_in_chunks(conn, sql, ids)}
+
+
+def call_adjacency(conn: sqlite3.Connection) -> dict[int, set[int]]:
+    """Caller symbol id -> the ids it calls: the direct-call graph, loaded
+    once and shared by every `find_call_path` of one request."""
+    adjacency: dict[int, set[int]] = {}
+    for src, tgt in _load_call_edges(conn):
+        adjacency.setdefault(src, set()).add(tgt)
+    return adjacency
+
+
 def find_call_path(
-    conn: sqlite3.Connection, from_symbol_id: int, to_symbol_id: int, max_depth: int = 6
+    conn: sqlite3.Connection,
+    from_symbol_id: int,
+    to_symbol_id: int,
+    max_depth: int = 6,
+    adjacency: dict[int, set[int]] | None = None,
 ) -> list[dict] | None:
     """BFS over `calls` from `from_symbol_id` to `to_symbol_id`, returning
     one concrete sequence of function symbols connecting them (inclusive of
@@ -862,9 +1022,8 @@ def find_call_path(
         ).fetchone()
         return [dict(row)] if row is not None else None
 
-    adjacency: dict[int, set[int]] = {}
-    for src, tgt in _load_call_edges(conn):
-        adjacency.setdefault(src, set()).add(tgt)
+    if adjacency is None:
+        adjacency = call_adjacency(conn)
 
     parent: dict[int, int] = {}
     visited = {from_symbol_id}

@@ -27,13 +27,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
         return 1
     print(
         f"files: {stats.file_count} (parse errors: {stats.parse_error_count}, "
-        f"reused from cache: {stats.parse_cache_hits}, reparsed: {stats.parse_cache_misses})"
+        f"reused from cache: {stats.cache_hits}, re-extracted: {stats.cache_misses})"
     )
     print(
         f"functions: {stats.function_count}, signals: {stats.signal_count}, "
         f"fields: {stats.field_count}, enums: {stats.enum_count}"
     )
-    print(f"resolved calls: {stats.resolved_call_count}, unresolved: {stats.unresolved_call_count}")
+    print(
+        f"resolved calls: {stats.resolved_call_count}, unresolved: {stats.unresolved_call_count} "
+        f"(plus {stats.engine_call_count} calls into the engine / GDScript built-ins)"
+    )
     print(
         f"resolved signal connections: {stats.resolved_connection_count}, "
         f"unresolved: {stats.unresolved_connection_count}"

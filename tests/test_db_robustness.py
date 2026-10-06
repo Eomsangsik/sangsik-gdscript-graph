@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -164,7 +165,8 @@ func onXdied() -> void:
     pass
 """)
     conn = godot_project.build()
-    results = {r["name"] for r in gdb.search_symbols(conn, "on_died")}
+    rows, _ = gdb.search_symbols(conn, "on_died")
+    results = {r["name"] for r in rows}
     assert results == {"on_died"}
 
 
@@ -267,7 +269,7 @@ def test_failed_rebuild_preserves_existing_database(godot_project, monkeypatch):
 
     import gdscript_graph.db as db_module
 
-    def boom(conn, project_root, old_parse_cache=None):
+    def boom(conn, *args):
         conn.executescript(db_module.SCHEMA)
         raise RuntimeError("simulated failure")
 
@@ -434,3 +436,76 @@ def test_validate_schema_rejects_non_graph_database(tmp_path):
             gdb.validate_schema(conn)
     finally:
         conn.close()
+
+
+def test_concurrent_builds_never_swap_in_an_empty_database(godot_project):
+    """Regression test: two builds of the same db running at once (two
+    overlapping auto-rebuilds, or a CLI build during one) shared a per-process
+    temp file -- the second unlinked the first's, and the first swapped the
+    second's still-empty db into place: queries silently returned nothing
+    (callers -> []) until the next rebuild. Every build must keep its own
+    temp file, so readers only ever see a complete db."""
+    for i in range(150):
+        godot_project.write(f"f{i}.gd", f"extends Node\nfunc fn{i}():\n    helper()\nfunc helper():\n    pass\n")
+    db_path = godot_project.root.parent / "graph.db"
+    build_database(godot_project.root, db_path)
+
+    errors: list[BaseException] = []
+
+    def build() -> None:
+        try:
+            build_database(godot_project.root, db_path)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=build) for _ in range(3)]
+    for t in threads:
+        t.start()
+    counts = []
+    while any(t.is_alive() for t in threads):
+        conn = sqlite3.connect(db_path)
+        try:
+            counts.append(conn.execute("SELECT COUNT(*) FROM symbols WHERE kind = 'function'").fetchone()[0])
+        finally:
+            conn.close()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert set(counts) <= {300}
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 150
+    finally:
+        conn.close()
+    assert list(db_path.parent.glob(f"{db_path.name}.tmp-*")) == []
+
+
+def test_rebuild_keeps_the_database_file_mode(godot_project):
+    """The temp file a build writes into starts owner-only (mkstemp); the
+    db swapped into place must not silently lose its permissions."""
+    godot_project.write("main.gd", "extends Node\n")
+    db_path = godot_project.root.parent / "graph.db"
+    build_database(godot_project.root, db_path)
+    assert db_path.stat().st_mode & 0o777 == 0o644
+    db_path.chmod(0o664)
+    build_database(godot_project.root, db_path)
+    assert db_path.stat().st_mode & 0o777 == 0o664
+
+
+def test_search_ranks_exact_then_prefix_then_substring_matches(godot_project):
+    """Regression test: results were ordered by name alone, so searching
+    `get` buried the function actually named `get` behind every `get_*`."""
+    names = ["widget_get", "get_b", "get_a", "Get", "get", "forget", "get_long_name"]
+    godot_project.write("x.gd", "extends Node\n" + "".join(f"func {n}():\n    pass\n" for n in names))
+    godot_project.write("ui/y.gd", "extends Node\nsignal get_changed\nvar get_count := 0\n")
+    conn = godot_project.build()
+
+    rows, total = gdb.search_symbols(conn, "get", limit=5)
+    assert [r["name"] for r in rows] == ["get", "Get", "get_a", "get_b", "get_count"]
+    assert total == 9
+
+    rows, total = gdb.search_symbols(conn, "get", kind="signal")
+    assert ([r["name"] for r in rows], total) == (["get_changed"], 1)
+    rows, total = gdb.search_symbols(conn, "get", path_prefix="res://ui/")
+    assert {r["name"] for r in rows} == {"get_changed", "get_count"}
